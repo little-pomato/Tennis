@@ -620,6 +620,23 @@ def outside_clipped_support_ratio(line, clipped_seg, edges_roi, white_roi):
     white_hits = int(np.count_nonzero(cv2.bitwise_and(outside, white_roi)))
     return (edge_hits + 1.4 * white_hits) / outside_pixels
 
+
+def point_to_segment_endpoint_gap(pt, seg):
+    p = np.asarray(pt, dtype=np.float32)
+    p1 = np.asarray([seg["x1"], seg["y1"]], dtype=np.float32)
+    p2 = np.asarray([seg["x2"], seg["y2"]], dtype=np.float32)
+    return float(min(np.linalg.norm(p - p1), np.linalg.norm(p - p2)))
+
+
+def baseline_extension_gap(intersections, vertical_five):
+    gaps = [
+        point_to_segment_endpoint_gap(intersections["ld"], vertical_five["left_doubles"]),
+        point_to_segment_endpoint_gap(intersections["ls"], vertical_five["left_singles"]),
+        point_to_segment_endpoint_gap(intersections["rs"], vertical_five["right_singles"]),
+        point_to_segment_endpoint_gap(intersections["rd"], vertical_five["right_doubles"]),
+    ]
+    return float(np.mean(gaps)), float(max(gaps))
+
 def score_service_line_candidate(line, cluster, vertical_five, img_w, img_h):
     ld = vertical_five["left_doubles"]
     ls = vertical_five["left_singles"]
@@ -905,6 +922,20 @@ def score_baseline_candidate(line, cluster, side, vertical_five, service_lines, 
     if inner_width < 0.10 * img_w or outer_width < 0.15 * img_w:
         return None
 
+    intersections = {
+        "ld": inter_ld,
+        "ls": inter_ls,
+        "rs": inter_rs,
+        "rd": inter_rd,
+    }
+    mean_extension_gap, max_extension_gap = baseline_extension_gap(intersections, vertical_five)
+    if side == "far":
+        soft_gap = 0.08 * img_h   # tightened from 0.16 — far intersections must be near segment tops
+    else:
+        soft_gap = 0.12 * img_h
+    extension_gap_penalty = max(0.0, mean_extension_gap - soft_gap) * 1.4
+    extension_gap_penalty += max(0.0, max_extension_gap - soft_gap * 1.7) * 0.8
+
     clipped_outer, _, _ = clipped_segment_between_lines(line, ld, rd, img_w, img_h)
     clipped_inner, _, _ = clipped_segment_between_lines(line, ls, rs, img_w, img_h)
     if clipped_outer is None or clipped_inner is None:
@@ -929,6 +960,10 @@ def score_baseline_candidate(line, cluster, side, vertical_five, service_lines, 
     pred_mx, pred_my = seg_mid(pred_line)
 
     y_penalty = abs(my - pred_my)
+    # Fix 2: hard-reject far candidates that are far from H0's prediction.
+    # Prevents strongly-lit wall lines from outscoring the true baseline.
+    if side == "far" and y_penalty > 0.08 * img_h:
+        return None
     x_penalty = abs(mx - pred_mx)
     angle_match_penalty = angle_diff_deg(line["angle_deg"], pred_line["angle_deg"])
 
@@ -938,7 +973,7 @@ def score_baseline_candidate(line, cluster, side, vertical_five, service_lines, 
         if my >= far_service_y:
             return None
         service_gap = far_service_y - my
-        min_gap = 0.065 * img_h
+        min_gap = 0.04 * img_h   # relaxed from 0.065 — low-angle cameras compress far end
         max_gap = 0.28 * img_h
         if service_gap < min_gap or service_gap > max_gap:
             return None
@@ -973,6 +1008,7 @@ def score_baseline_candidate(line, cluster, side, vertical_five, service_lines, 
         - 12.0 * angle_match_penalty
         - 1.15 * width_penalty
         - outside_penalty
+        - extension_gap_penalty
         - top_corner_penalty(line, img_w, img_h)
     )
 
@@ -983,12 +1019,7 @@ def score_baseline_candidate(line, cluster, side, vertical_five, service_lines, 
         "side": side,
         "mx": mx,
         "my": my,
-        "intersections": {
-            "ld": inter_ld,
-            "ls": inter_ls,
-            "rs": inter_rs,
-            "rd": inter_rd,
-        },
+        "intersections": intersections,
         "clipped_outer": clipped_outer,
         "clipped_inner": clipped_inner,
         "pred_line": pred_line,
@@ -1009,6 +1040,9 @@ def score_baseline_candidate(line, cluster, side, vertical_five, service_lines, 
             "support_ratio": support["support_ratio"],
             "outside_support_ratio": outside_support,
             "outside_penalty": outside_penalty,
+            "mean_extension_gap": mean_extension_gap,
+            "max_extension_gap": max_extension_gap,
+            "extension_gap_penalty": extension_gap_penalty,
         }
     }
 
@@ -1090,6 +1124,9 @@ def choose_baselines(horizontal_group, vertical_five, service_lines, H_hint, mod
                     "support_ratio": 0.0,
                     "outside_support_ratio": 0.0,
                     "outside_penalty": 0.0,
+                    "mean_extension_gap": 0.0,
+                    "max_extension_gap": 0.0,
+                    "extension_gap_penalty": 0.0,
                 },
             }
 
@@ -1145,15 +1182,25 @@ def choose_baselines(horizontal_group, vertical_five, service_lines, H_hint, mod
 
 def save_baselines_debug(img, vertical_five, service_lines, baselines, out_path):
     out = img.copy()
-    draw_named_seg(out, vertical_five["left_doubles"],   (0, 0, 255),   "left_doubles")
-    draw_named_seg(out, vertical_five["left_singles"],   (0, 255, 0),   "left_singles")
+    draw_named_seg(out, vertical_five["left_doubles"],   (0, 0, 120),   "raw_left_doubles", 1)
+    draw_named_seg(out, vertical_five["left_singles"],   (0, 120, 0),   "raw_left_singles", 1)
     draw_named_seg(out, vertical_five["center_service"], (255, 0, 255), "center_service")
-    draw_named_seg(out, vertical_five["right_singles"],  (255, 0, 0),   "right_singles")
-    draw_named_seg(out, vertical_five["right_doubles"],  (0, 255, 255), "right_doubles")
+    draw_named_seg(out, vertical_five["right_singles"],  (120, 0, 0),   "raw_right_singles", 1)
+    draw_named_seg(out, vertical_five["right_doubles"],  (0, 120, 120), "raw_right_doubles", 1)
     draw_named_seg(out, service_lines["far_service"],    (255, 255, 255), "far_service", 2)
     draw_named_seg(out, service_lines["near_service"],   (180, 255, 180), "near_service", 2)
-    draw_named_seg(out, baselines["far_baseline"],       (255, 200, 0), "far_baseline", 2)
-    draw_named_seg(out, baselines["near_baseline"],      (0, 200, 255), "near_baseline", 2)
+
+    for side, color in (("far", (255, 200, 0)), ("near", (0, 200, 255))):
+        cand = baselines.get(f"{side}_candidate")
+        if cand is None:
+            continue
+        clipped = cand.get("clipped_outer", cand["line"])
+        draw_named_seg(out, clipped, color, f"{side}_baseline_clipped", 3)
+        pts = cand.get("intersections", {})
+        for name in ("ld", "ls", "rs", "rd"):
+            if name in pts:
+                cv2.circle(out, clip_pt(pts[name], img.shape[1], img.shape[0]), 4, color, -1)
+
     cv2.imwrite(out_path, out)
 
 
@@ -2086,14 +2133,18 @@ def visualize_groups(img, result):
 def visualize_main_five(img, result):
     out = img.copy()
     vf = result["vertical_five"]
-    draw_seg(out, vf["left_doubles"], (255, 0, 255), 3)
-    draw_seg(out, vf["left_singles"], (255, 128, 0), 3)
-    draw_seg(out, vf["right_singles"], (255, 128, 0), 3)
-    draw_seg(out, vf["right_doubles"], (255, 0, 255), 3)
+    draw_seg(out, vf["left_doubles"], (120, 0, 120), 1)
+    draw_seg(out, vf["left_singles"], (120, 70, 0), 1)
+    draw_seg(out, vf["right_singles"], (120, 70, 0), 1)
+    draw_seg(out, vf["right_doubles"], (120, 0, 120), 1)
     draw_seg(out, result["near_service"], (0, 255, 255), 3)
     draw_seg(out, result["far_service"], (255, 255, 255), 3)
-    draw_seg(out, result["baselines"]["near_baseline"], (0, 200, 255), 3)
-    draw_seg(out, result["baselines"]["far_baseline"], (255, 200, 0), 3)
+    baselines = result.get("baselines", {})
+    for side, color in (("far", (255, 200, 0)), ("near", (0, 200, 255))):
+        cand = baselines.get(f"{side}_candidate")
+        if cand is None:
+            continue
+        draw_seg(out, cand.get("clipped_outer", cand["line"]), color, 3)
     return out
 
 
@@ -2125,9 +2176,9 @@ def validate_roi_config(cfg, img_shape):
 
     if not (far_y < far_service_y < net_y < near_service_y < near_y):
         return False, "court_y_order_invalid"
-    if far_y > 0.235 * h:
+    if far_y > 0.40 * h:
         return False, "far_baseline_too_low"
-    if far_service_y - far_y < 0.065 * h:
+    if far_service_y - far_y < 0.04 * h:
         return False, "far_service_too_close_to_far_baseline"
 
     singles = cfg.get("SINGLES_LINES", [])

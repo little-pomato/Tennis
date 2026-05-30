@@ -17,6 +17,7 @@ while using tracking to reduce wrong-person selection.
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -25,6 +26,12 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 import torch
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+TRAINING_DIR = PROJECT_ROOT / "training"
+if str(TRAINING_DIR) not in sys.path:
+    sys.path.insert(0, str(TRAINING_DIR))
 
 # Reuse the exact model / transform definitions used during training.
 from train_tennis_actions import build_model, build_transforms, get_device

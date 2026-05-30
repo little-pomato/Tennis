@@ -191,7 +191,7 @@ def fit_line_through_points(points, out_w, out_h):
     if len(pts) < 2:
         return None
 
-    vx, vy, x0, y0 = cv2.fitLine(pts, cv2.DIST_L2, 0, 0.01, 0.01)
+    vx, vy, x0, y0 = cv2.fitLine(pts, cv2.DIST_L2, 0, 0.01, 0.01).reshape(-1)
     vx, vy, x0, y0 = float(vx), float(vy), float(x0), float(y0)
 
     if abs(vx) < 1e-8 and abs(vy) < 1e-8:
@@ -224,7 +224,20 @@ def fit_line_through_points(points, out_w, out_h):
 # =========================================================
 # preprocess
 # =========================================================
-def preprocess(img_bgr):
+def build_static_ignore_mask(img_shape):
+    h, w = img_shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+
+    # Broadcast scoreboards usually live in the upper corners. Keep the top
+    # center available because the far baseline often crosses that area.
+    corner_w = int(0.22 * w)
+    corner_h = int(0.18 * h)
+    cv2.rectangle(mask, (0, 0), (corner_w, corner_h), 255, -1)
+    cv2.rectangle(mask, (w - corner_w, 0), (w - 1, corner_h), 255, -1)
+    return mask
+
+
+def preprocess(img_bgr, ignore_mask=None):
     h, w = img_bgr.shape[:2]
 
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
@@ -246,6 +259,8 @@ def preprocess(img_bgr):
     ], dtype=np.int32)
     cv2.fillConvexPoly(roi, pts, 255)
     roi[int(0.94 * h):, :] = 0
+    if ignore_mask is not None:
+        roi = cv2.bitwise_and(roi, cv2.bitwise_not(ignore_mask))
 
     edges_roi = cv2.bitwise_and(edges, roi)
 
@@ -500,6 +515,16 @@ def horizontal_angle_penalty(seg):
     a = seg["angle_deg"] % 180
     return min(abs(a - 0), abs(a - 180))
 
+
+def top_corner_penalty(seg, img_w, img_h):
+    mx, my = seg_mid(seg)
+    in_top = my < 0.18 * img_h
+    in_left = mx < 0.22 * img_w
+    in_right = mx > 0.78 * img_w
+    if in_top and (in_left or in_right):
+        return 120.0
+    return 0.0
+
 def point_projection_ratio_on_seg(pt, seg):
     x1, y1 = seg["x1"], seg["y1"]
     x2, y2 = seg["x2"], seg["y2"]
@@ -512,6 +537,88 @@ def point_projection_ratio_on_seg(pt, seg):
 
     t = ((px - x1) * vx + (py - y1) * vy) / denom
     return float(t)
+
+
+def line_through_point_with_angle(pt, angle_deg, img_w, img_h):
+    px, py = pt
+    rad = math.radians(angle_deg)
+    dx = math.cos(rad)
+    dy = math.sin(rad)
+    if abs(dx) < 1e-8 and abs(dy) < 1e-8:
+        return None
+
+    candidates = []
+    if abs(dx) > 1e-8:
+        for x in (0.0, float(img_w - 1)):
+            t = (x - px) / dx
+            y = py + t * dy
+            if -img_h <= y <= 2 * img_h:
+                candidates.append((x, y))
+    if abs(dy) > 1e-8:
+        for y in (0.0, float(img_h - 1)):
+            t = (y - py) / dy
+            x = px + t * dx
+            if -img_w <= x <= 2 * img_w:
+                candidates.append((x, y))
+
+    if len(candidates) < 2:
+        scale = max(img_w, img_h)
+        candidates = [(px - dx * scale, py - dy * scale), (px + dx * scale, py + dy * scale)]
+
+    p1 = candidates[0]
+    p2 = max(candidates[1:], key=lambda p: math.hypot(p[0] - p1[0], p[1] - p1[1]))
+    angle = normalize_angle_deg(math.degrees(math.atan2(p2[1] - p1[1], p2[0] - p1[0])))
+    return {
+        "x1": int(round(p1[0])), "y1": int(round(p1[1])),
+        "x2": int(round(p2[0])), "y2": int(round(p2[1])),
+        "angle_deg": angle,
+        "length": float(math.hypot(p2[0] - p1[0], p2[1] - p1[1])),
+    }
+
+
+def make_segment_from_points(p1, p2):
+    angle = normalize_angle_deg(math.degrees(math.atan2(p2[1] - p1[1], p2[0] - p1[0])))
+    return {
+        "x1": float(p1[0]), "y1": float(p1[1]),
+        "x2": float(p2[0]), "y2": float(p2[1]),
+        "angle_deg": angle,
+        "length": float(math.hypot(p2[0] - p1[0], p2[1] - p1[1])),
+    }
+
+
+def clipped_segment_between_lines(base_line, left_line, right_line, img_w, img_h, margin=0.35):
+    left_pt = safe_intersection(base_line, left_line, img_w, img_h, margin=margin)
+    right_pt = safe_intersection(base_line, right_line, img_w, img_h, margin=margin)
+    if left_pt is None or right_pt is None:
+        return None, left_pt, right_pt
+    if left_pt[0] > right_pt[0]:
+        left_pt, right_pt = right_pt, left_pt
+    return make_segment_from_points(left_pt, right_pt), left_pt, right_pt
+
+
+def segment_support_metrics(seg, edges_roi, white_roi, thickness=7):
+    band = line_band_mask(edges_roi.shape, seg, thickness=thickness)
+    band_pixels = max(1, int(np.count_nonzero(band)))
+    edge_hits = int(np.count_nonzero(cv2.bitwise_and(band, edges_roi)))
+    white_hits = int(np.count_nonzero(cv2.bitwise_and(band, white_roi)))
+    return {
+        "band_pixels": band_pixels,
+        "edge_hits": edge_hits,
+        "white_hits": white_hits,
+        "edge_ratio": edge_hits / band_pixels,
+        "white_ratio": white_hits / band_pixels,
+        "support_ratio": (edge_hits + 1.4 * white_hits) / band_pixels,
+    }
+
+
+def outside_clipped_support_ratio(line, clipped_seg, edges_roi, white_roi):
+    full_band = line_band_mask(edges_roi.shape, line, thickness=7)
+    clipped_band = line_band_mask(edges_roi.shape, clipped_seg, thickness=9)
+    outside = cv2.bitwise_and(full_band, cv2.bitwise_not(clipped_band))
+    outside_pixels = max(1, int(np.count_nonzero(outside)))
+    edge_hits = int(np.count_nonzero(cv2.bitwise_and(outside, edges_roi)))
+    white_hits = int(np.count_nonzero(cv2.bitwise_and(outside, white_roi)))
+    return (edge_hits + 1.4 * white_hits) / outside_pixels
 
 def score_service_line_candidate(line, cluster, vertical_five, img_w, img_h):
     ld = vertical_five["left_doubles"]
@@ -608,6 +715,7 @@ def score_service_line_candidate(line, cluster, vertical_five, img_w, img_h):
         - 0.7 * outer_sym_penalty
         + 0.4 * inner_width
         - 180.0 * endpoint_penalty
+        - top_corner_penalty(line, img_w, img_h)
     )
     
     # print(
@@ -674,6 +782,31 @@ def choose_service_lines(horizontal_group, vertical_five, img_w, img_h, debug=Fa
     near_candidates = [c for c in candidates if c["service_side"] == "near"]
 
     if not far_candidates or not near_candidates:
+        if near_candidates:
+            best_near = max(near_candidates, key=lambda c: c["score"])
+            top_pt, _ = seg_endpoints_top_bottom(cs)
+            inferred_far = line_through_point_with_angle(top_pt, best_near["line"]["angle_deg"], img_w, img_h)
+            if inferred_far is not None:
+                return {
+                    "far_service": inferred_far,
+                    "near_service": best_near["line"],
+                    "far_candidate": {
+                        "line": inferred_far,
+                        "cluster": [],
+                        "score": best_near["score"] * 0.45,
+                        "service_side": "far",
+                        "source": "projected",
+                        "mx": seg_mid(inferred_far)[0],
+                        "my": seg_mid(inferred_far)[1],
+                    },
+                    "near_candidate": best_near,
+                    "all_candidates": candidates,
+                    "line_sources": {
+                        "far_service": "projected",
+                        "near_service": "detected",
+                    },
+                    "warnings": ["far_service_projected_from_center_service_endpoint"],
+                }
         return None
 
     best_pair = None
@@ -728,6 +861,11 @@ def choose_service_lines(horizontal_group, vertical_five, img_w, img_h, debug=Fa
         "far_candidate": best_far,
         "near_candidate": best_near,
         "all_candidates": candidates,
+        "line_sources": {
+            "far_service": "detected",
+            "near_service": "detected",
+        },
+        "warnings": [],
     }
     
 def save_service_lines_debug(img, vertical_five, service_lines, out_path):
@@ -744,11 +882,13 @@ def save_service_lines_debug(img, vertical_five, service_lines, out_path):
 
     cv2.imwrite(out_path, out)
 
-def score_baseline_candidate(line, cluster, side, vertical_five, H_hint, model, img_w, img_h):
+def score_baseline_candidate(line, cluster, side, vertical_five, service_lines, H_hint, model, img_w, img_h, edges_roi, white_roi):
     ld = vertical_five["left_doubles"]
     ls = vertical_five["left_singles"]
     rs = vertical_five["right_singles"]
     rd = vertical_five["right_doubles"]
+    far_service = service_lines["far_service"]
+    near_service = service_lines["near_service"]
 
     inter_ld = safe_intersection(line, ld, img_w, img_h)
     inter_ls = safe_intersection(line, ls, img_w, img_h)
@@ -763,6 +903,11 @@ def score_baseline_candidate(line, cluster, side, vertical_five, H_hint, model, 
     inner_width = inter_rs[0] - inter_ls[0]
     outer_width = inter_rd[0] - inter_ld[0]
     if inner_width < 0.10 * img_w or outer_width < 0.15 * img_w:
+        return None
+
+    clipped_outer, _, _ = clipped_segment_between_lines(line, ld, rd, img_w, img_h)
+    clipped_inner, _, _ = clipped_segment_between_lines(line, ls, rs, img_w, img_h)
+    if clipped_outer is None or clipped_inner is None:
         return None
 
     alley_l = inter_ls[0] - inter_ld[0]
@@ -787,6 +932,29 @@ def score_baseline_candidate(line, cluster, side, vertical_five, H_hint, model, 
     x_penalty = abs(mx - pred_mx)
     angle_match_penalty = angle_diff_deg(line["angle_deg"], pred_line["angle_deg"])
 
+    far_service_y = seg_mid(far_service)[1]
+    near_service_y = seg_mid(near_service)[1]
+    if side == "far":
+        if my >= far_service_y:
+            return None
+        service_gap = far_service_y - my
+        min_gap = 0.065 * img_h
+        max_gap = 0.28 * img_h
+        if service_gap < min_gap or service_gap > max_gap:
+            return None
+    else:
+        if my <= near_service_y:
+            return None
+        service_gap = my - near_service_y
+        min_gap = 0.075 * img_h
+        max_gap = 0.35 * img_h
+        if service_gap < min_gap or service_gap > max_gap:
+            return None
+
+    support = segment_support_metrics(clipped_outer, edges_roi, white_roi, thickness=7)
+    outside_support = outside_clipped_support_ratio(line, clipped_outer, edges_roi, white_roi)
+    outside_penalty = max(0.0, outside_support - support["support_ratio"]) * 260.0
+
     inter_pred_ld = safe_intersection(pred_line, ld, img_w, img_h)
     inter_pred_rd = safe_intersection(pred_line, rd, img_w, img_h)
     width_penalty = 0.0
@@ -795,14 +963,17 @@ def score_baseline_candidate(line, cluster, side, vertical_five, H_hint, model, 
         width_penalty = abs(outer_width - pred_outer)
 
     score = (
-        1.3 * total_len
+        0.18 * min(total_len, clipped_outer["length"] * 1.35)
+        + 360.0 * support["support_ratio"]
+        + 0.35 * clipped_outer["length"]
         - 11.0 * horiz_pen
         - 1.2 * alley_penalty
-        - 1.8 * y_penalty
+        - 2.6 * y_penalty
         - 0.25 * x_penalty
-        - 8.0 * angle_match_penalty
-        - 0.8 * width_penalty
-        + 0.3 * outer_width
+        - 12.0 * angle_match_penalty
+        - 1.15 * width_penalty
+        - outside_penalty
+        - top_corner_penalty(line, img_w, img_h)
     )
 
     return {
@@ -818,22 +989,31 @@ def score_baseline_candidate(line, cluster, side, vertical_five, H_hint, model, 
             "rs": inter_rs,
             "rd": inter_rd,
         },
+        "clipped_outer": clipped_outer,
+        "clipped_inner": clipped_inner,
         "pred_line": pred_line,
         "metrics": {
             "total_len": total_len,
             "inner_width": inner_width,
             "outer_width": outer_width,
+            "clipped_outer_length": clipped_outer["length"],
             "alley_penalty": alley_penalty,
             "horiz_pen": horiz_pen,
             "y_penalty": y_penalty,
             "x_penalty": x_penalty,
             "angle_match_penalty": angle_match_penalty,
             "width_penalty": width_penalty,
+            "service_gap": service_gap,
+            "edge_ratio": support["edge_ratio"],
+            "white_ratio": support["white_ratio"],
+            "support_ratio": support["support_ratio"],
+            "outside_support_ratio": outside_support,
+            "outside_penalty": outside_penalty,
         }
     }
 
 
-def choose_baselines(horizontal_group, vertical_five, service_lines, H_hint, model, img_w, img_h):
+def choose_baselines(horizontal_group, vertical_five, service_lines, H_hint, model, img_w, img_h, edges_roi, white_roi):
     if not horizontal_group or vertical_five is None or service_lines is None or H_hint is None:
         return None
 
@@ -858,19 +1038,71 @@ def choose_baselines(horizontal_group, vertical_five, service_lines, H_hint, mod
 
         my = seg_mid(line)[1]
         if my >= near_service_y - 0.03 * img_h:
-            cand = score_baseline_candidate(line, cl, "near", vertical_five, H_hint, model, img_w, img_h)
+            cand = score_baseline_candidate(line, cl, "near", vertical_five, service_lines, H_hint, model, img_w, img_h, edges_roi, white_roi)
             if cand is not None:
                 cand["cluster_id"] = idx
+                cand["source"] = "detected"
                 near_candidates.append(cand)
 
         if my <= far_service_y + 0.03 * img_h:
-            cand = score_baseline_candidate(line, cl, "far", vertical_five, H_hint, model, img_w, img_h)
+            cand = score_baseline_candidate(line, cl, "far", vertical_five, service_lines, H_hint, model, img_w, img_h, edges_roi, white_roi)
             if cand is not None:
                 cand["cluster_id"] = idx
+                cand["source"] = "detected"
                 far_candidates.append(cand)
 
     if not far_candidates or not near_candidates:
-        return None
+        def projected_candidate(side):
+            line = project_model_line(H_hint, model, f"{side}_baseline")
+            ld = vertical_five["left_doubles"]
+            rd = vertical_five["right_doubles"]
+            inter_ld = safe_intersection(line, ld, img_w, img_h, margin=0.45)
+            inter_rd = safe_intersection(line, rd, img_w, img_h, margin=0.45)
+            if inter_ld is None or inter_rd is None:
+                return None
+            outer_width = abs(inter_rd[0] - inter_ld[0])
+            mx, my = seg_mid(line)
+            clipped_outer, _, _ = clipped_segment_between_lines(line, vertical_five["left_doubles"], vertical_five["right_doubles"], img_w, img_h)
+            return {
+                "line": line,
+                "cluster": [],
+                "score": -250.0,
+                "side": side,
+                "source": "projected",
+                "mx": mx,
+                "my": my,
+                "clipped_outer": clipped_outer if clipped_outer is not None else line,
+                "intersections": {"ld": inter_ld, "rd": inter_rd},
+                "pred_line": line,
+                "metrics": {
+                    "total_len": 0.0,
+                    "inner_width": outer_width * 0.75,
+                    "outer_width": outer_width,
+                    "alley_penalty": 0.0,
+                    "horiz_pen": horizontal_angle_penalty(line),
+                    "y_penalty": 0.0,
+                    "x_penalty": 0.0,
+                    "angle_match_penalty": 0.0,
+                    "width_penalty": 0.0,
+                    "service_gap": 0.0,
+                    "edge_ratio": 0.0,
+                    "white_ratio": 0.0,
+                    "support_ratio": 0.0,
+                    "outside_support_ratio": 0.0,
+                    "outside_penalty": 0.0,
+                },
+            }
+
+        if not far_candidates:
+            cand = projected_candidate("far")
+            if cand is not None:
+                far_candidates.append(cand)
+        if not near_candidates:
+            cand = projected_candidate("near")
+            if cand is not None:
+                near_candidates.append(cand)
+        if not far_candidates or not near_candidates:
+            return None
 
     best_pair = None
     best_pair_score = -1e18
@@ -899,6 +1131,15 @@ def choose_baselines(horizontal_group, vertical_five, service_lines, H_hint, mod
         "near_candidate": best_near,
         "all_far_candidates": far_candidates,
         "all_near_candidates": near_candidates,
+        "line_sources": {
+            "far_baseline": best_far.get("source", "detected"),
+            "near_baseline": best_near.get("source", "detected"),
+        },
+        "warnings": [
+            f"{side}_baseline_projected_from_service_homography"
+            for side, cand in (("far", best_far), ("near", best_near))
+            if cand.get("source") == "projected"
+        ],
     }
 
 
@@ -913,6 +1154,41 @@ def save_baselines_debug(img, vertical_five, service_lines, baselines, out_path)
     draw_named_seg(out, service_lines["near_service"],   (180, 255, 180), "near_service", 2)
     draw_named_seg(out, baselines["far_baseline"],       (255, 200, 0), "far_baseline", 2)
     draw_named_seg(out, baselines["near_baseline"],      (0, 200, 255), "near_baseline", 2)
+    cv2.imwrite(out_path, out)
+
+
+def save_baseline_candidates_debug(img, baselines, out_path):
+    out = img.copy()
+    candidates = []
+    for side, color in (("far", (255, 200, 0)), ("near", (0, 200, 255))):
+        key = f"all_{side}_candidates"
+        for cand in baselines.get(key, []):
+            candidates.append((side, cand, color))
+
+    for side, cand, color in sorted(candidates, key=lambda item: item[1].get("score", 0.0), reverse=True):
+        line = cand["line"]
+        clipped = cand.get("clipped_outer", line)
+        faint = tuple(int(c * 0.45) for c in color)
+        draw_seg(out, line, faint, 1)
+        draw_seg(out, clipped, color, 3)
+        mx, my = seg_mid(clipped)
+        metrics = cand.get("metrics", {})
+        label = (
+            f"{side} {cand.get('score', 0):.0f} "
+            f"s={metrics.get('support_ratio', 0):.2f} "
+            f"out={metrics.get('outside_support_ratio', 0):.2f}"
+        )
+        cv2.putText(
+            out,
+            label,
+            (int(mx) + 4, int(my) - 4),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+
     cv2.imwrite(out_path, out)
 
 def choose_vertical_five_with_center(vertical_group, img_w, img_h):
@@ -1541,9 +1817,16 @@ def build_roi_config_from_result(image_path, img_shape, result):
 
     # =====================================================
     # 7) SINGLES_LINES：TL, BL, TR, BR
+    # Save true intersections with the baselines so the exported vertical
+    # lines always meet the court rectangle.
     # =====================================================
-    left_top, left_bottom = seg_endpoints_top_bottom(vf["left_singles"])
-    right_top, right_bottom = seg_endpoints_top_bottom(vf["right_singles"])
+    left_top = line_intersection(vf["left_singles"], far_baseline)
+    left_bottom = line_intersection(vf["left_singles"], near_baseline)
+    right_top = line_intersection(vf["right_singles"], far_baseline)
+    right_bottom = line_intersection(vf["right_singles"], near_baseline)
+    if None in (left_top, left_bottom, right_top, right_bottom):
+        left_top, left_bottom = seg_endpoints_top_bottom(vf["left_singles"])
+        right_top, right_bottom = seg_endpoints_top_bottom(vf["right_singles"])
 
     SINGLES_LINES = [
         clip_pt(left_top, w, h),
@@ -1555,8 +1838,13 @@ def build_roi_config_from_result(image_path, img_shape, result):
     # =====================================================
     # 8) DOUBLES_LINES：TL, BL, TR, BR
     # =====================================================
-    ld_top, ld_bottom = seg_endpoints_top_bottom(vf["left_doubles"])
-    rd_top, rd_bottom = seg_endpoints_top_bottom(vf["right_doubles"])
+    ld_top = line_intersection(vf["left_doubles"], far_baseline)
+    ld_bottom = line_intersection(vf["left_doubles"], near_baseline)
+    rd_top = line_intersection(vf["right_doubles"], far_baseline)
+    rd_bottom = line_intersection(vf["right_doubles"], near_baseline)
+    if None in (ld_top, ld_bottom, rd_top, rd_bottom):
+        ld_top, ld_bottom = seg_endpoints_top_bottom(vf["left_doubles"])
+        rd_top, rd_bottom = seg_endpoints_top_bottom(vf["right_doubles"])
 
     DOUBLES_LINES = [
         clip_pt(ld_top, w, h),
@@ -1594,6 +1882,14 @@ def build_roi_config_from_result(image_path, img_shape, result):
 
         "SINGLES_LINES": SINGLES_LINES,
         "DOUBLES_LINES": DOUBLES_LINES,
+        "detector": {
+            "type": "hybrid_line_v1",
+            "frames_sampled": int(result.get("frames_sampled", 1)),
+            "selected_frame": str(result.get("selected_frame", image_path)),
+            "score": float(result.get("score", 0.0)),
+            "line_sources": result.get("line_sources", {}),
+            "warnings": result.get("warnings", []),
+        },
     }
     return out
 
@@ -1642,18 +1938,21 @@ def score_hypothesis(H, model, edges_roi, white_roi, merged_lines):
 # main pipeline
 # =========================================================
 def reconstruct_from_five_line_method(img, edges_roi, white_roi, merged_lines, debug_dir=None):
-    debug_dir = Path(debug_dir) if debug_dir is not None else Path("court_detector_debug")
-    ensure_dir(debug_dir)
+    debug_dir = Path(debug_dir) if debug_dir is not None else None
+    if debug_dir is not None:
+        ensure_dir(debug_dir)
+    verbose = debug_dir is not None
     h, w = img.shape[:2]
     horizontal, vertical, other = split_horizontal_vertical(merged_lines)
    
-    save_segments_debug(img, vertical, str(debug_dir / "09a_vertical_raw.jpg"), color=(0,255,255))
-    save_segments_debug(img, horizontal, str(debug_dir / "09b_horizontal_raw.jpg"), color=(255,0,255))
-    save_vertical_candidates_debug(img, vertical, w, h, debug_dir=debug_dir)
+    if debug_dir is not None:
+        save_segments_debug(img, vertical, str(debug_dir / "09a_vertical_raw.jpg"), color=(0,255,255))
+        save_segments_debug(img, horizontal, str(debug_dir / "09b_horizontal_raw.jpg"), color=(255,0,255))
+        save_vertical_candidates_debug(img, vertical, w, h, debug_dir=debug_dir)
     
     vertical_five = choose_vertical_five_with_center(vertical, w, h)
     
-    if vertical_five is not None:
+    if vertical_five is not None and debug_dir is not None:
         dbg = img.copy()
 
         draw_named_seg(dbg, vertical_five["left_doubles"],  (0, 0, 255),   "left_doubles")
@@ -1665,12 +1964,14 @@ def reconstruct_from_five_line_method(img, edges_roi, white_roi, merged_lines, d
         cv2.imwrite(str(debug_dir / "11_five_lines_debug.jpg"), dbg)
 
     if vertical_five is None:
-        print("FAIL: choose_vertical_five")
+        if verbose:
+            print("FAIL: choose_vertical_five")
         return None
 
     service_lines = choose_service_lines(horizontal, vertical_five, w, h, debug=True)
     if service_lines is None:
-        print("FAIL: choose_service_lines")
+        if verbose:
+            print("FAIL: choose_service_lines")
         return None
 
     near_service = service_lines["near_service"]
@@ -1680,36 +1981,46 @@ def reconstruct_from_five_line_method(img, edges_roi, white_roi, merged_lines, d
     if far_service is None:
         return None
     
-    save_service_lines_debug(
-        img,
-        vertical_five,
-        service_lines,
-        str(debug_dir / "12_service_lines_debug.jpg")
-    )
+    if debug_dir is not None:
+        save_service_lines_debug(
+            img,
+            vertical_five,
+            service_lines,
+            str(debug_dir / "12_service_lines_debug.jpg")
+        )
     
     model = build_tennis_court_model()
     
     H0 = compute_homography_from_services(vertical_five, service_lines, model)
     if H0 is None:
-        print("FAIL: compute_homography_from_services")
+        if verbose:
+            print("FAIL: compute_homography_from_services")
         return None
 
-    baselines = choose_baselines(horizontal, vertical_five, service_lines, H0, model, w, h)
+    baselines = choose_baselines(horizontal, vertical_five, service_lines, H0, model, w, h, edges_roi, white_roi)
     if baselines is None:
-        print("FAIL: choose_baselines")
+        if verbose:
+            print("FAIL: choose_baselines")
         return None
 
-    save_baselines_debug(
-        img,
-        vertical_five,
-        service_lines,
-        baselines,
-        str(debug_dir / "13_baselines_debug.jpg")
-    )
+    if debug_dir is not None:
+        save_baselines_debug(
+            img,
+            vertical_five,
+            service_lines,
+            baselines,
+            str(debug_dir / "13_baselines_debug.jpg")
+        )
+        save_baseline_candidates_debug(
+            img,
+            baselines,
+            str(debug_dir / "17_baseline_candidates_scored.jpg")
+        )
 
     H1 = compute_homography_full_court(vertical_five, service_lines, baselines, model)
     if H1 is None:
-        print("WARN: compute_homography_full_court failed, fallback to H0")
+        if verbose:
+            print("WARN: compute_homography_full_court failed, fallback to H0")
         H1 = H0
 
     main_roi = make_main_roi(img.shape, vertical_five, baselines["near_baseline"], H1, model)
@@ -1727,6 +2038,19 @@ def reconstruct_from_five_line_method(img, edges_roi, white_roi, merged_lines, d
         img_shape=img.shape,
     )
 
+    line_sources = {
+        "left_doubles": "detected",
+        "left_singles": "detected",
+        "center_service": "detected",
+        "right_singles": "detected",
+        "right_doubles": "detected",
+    }
+    line_sources.update(service_lines.get("line_sources", {}))
+    line_sources.update(baselines.get("line_sources", {}))
+    warnings = []
+    warnings.extend(service_lines.get("warnings", []))
+    warnings.extend(baselines.get("warnings", []))
+
     return {
         "H": H1,
         "H0": H0,
@@ -1742,6 +2066,8 @@ def reconstruct_from_five_line_method(img, edges_roi, white_roi, merged_lines, d
         "overlap_white": overlap_white,
         "groups": {"horizontal": horizontal, "vertical": vertical},
         "net_lines": net_lines,
+        "line_sources": line_sources,
+        "warnings": warnings,
     }
 
 
@@ -1770,78 +2096,192 @@ def visualize_main_five(img, result):
     draw_seg(out, result["baselines"]["far_baseline"], (255, 200, 0), 3)
     return out
 
-def auto_pick_roi(input_path, out_json=None, output_dir=None):
-    paths = setup_detector_paths(input_path, output_dir=output_dir)
 
-    debug_dir = paths["OUT_DIR"]
-    if output_dir is None and out_json is not None:
-        debug_dir = Path(out_json).parent / "court_detector_debug"
-    ensure_dir(debug_dir)
+def polygon_area(poly):
+    pts = np.asarray(poly, dtype=np.float32)
+    if len(pts) < 3:
+        return 0.0
+    x = pts[:, 0]
+    y = pts[:, 1]
+    return float(abs(0.5 * np.sum(x * np.roll(y, -1) - y * np.roll(x, -1))))
 
-    img, image_source = read_image_or_first_frame(
-        paths["INPUT_PATH"],
-        frames_dir=paths["FRAMES_DIR"]
-    )
 
-    eq, gray, blur, edges, roi, edges_roi, white = preprocess(img)
+def validate_roi_config(cfg, img_shape):
+    h, w = img_shape[:2]
+    area = polygon_area(cfg.get("ROI_POLY", []))
+    frame_area = float(max(1, w * h))
+    area_ratio = area / frame_area
+    if area_ratio < 0.05 or area_ratio > 0.95:
+        return False, f"roi_area_ratio_out_of_range:{area_ratio:.3f}"
+
+    try:
+        far_y = np.mean([p[1] for p in cfg["FAR_BASELINE"]])
+        near_y = np.mean([p[1] for p in cfg["NEAR_BASELINE"]])
+        net_y = np.mean([p[1] for p in cfg["NET_LINE"]])
+        far_service_y = np.mean([p[1] for p in cfg["FAR_SERVICE_LINE"]])
+        near_service_y = np.mean([p[1] for p in cfg["NEAR_SERVICE_LINE"]])
+    except Exception:
+        return False, "missing_required_court_lines"
+
+    if not (far_y < far_service_y < net_y < near_service_y < near_y):
+        return False, "court_y_order_invalid"
+    if far_y > 0.235 * h:
+        return False, "far_baseline_too_low"
+    if far_service_y - far_y < 0.065 * h:
+        return False, "far_service_too_close_to_far_baseline"
+
+    singles = cfg.get("SINGLES_LINES", [])
+    doubles = cfg.get("DOUBLES_LINES", [])
+    if len(singles) != 4 or len(doubles) != 4:
+        return False, "vertical_line_points_missing"
+    if not (doubles[0][0] <= singles[0][0] <= singles[2][0] <= doubles[2][0]):
+        return False, "far_vertical_order_invalid"
+    if not (doubles[1][0] <= singles[1][0] <= singles[3][0] <= doubles[3][0]):
+        return False, "near_vertical_order_invalid"
+
+    return True, "ok"
+
+
+def collect_candidate_image_sources(input_path, frames_dir=None, max_frames=15, search_first=90):
+    input_path = Path(input_path)
+    frame_dir = Path(frames_dir) if frames_dir is not None else None
+
+    if frame_dir is None and input_path.suffix.lower() in IMAGE_EXTS and input_path.parent.name == "frames":
+        frame_dir = input_path.parent
+
+    if frame_dir is not None and frame_dir.exists():
+        frame_paths = sorted(
+            list(frame_dir.glob("*.jpg")) +
+            list(frame_dir.glob("*.jpeg")) +
+            list(frame_dir.glob("*.png"))
+        )
+        if frame_paths:
+            frame_paths = frame_paths[:max(1, min(search_first, len(frame_paths)))]
+            if len(frame_paths) <= max_frames:
+                return frame_paths
+            idxs = np.linspace(0, len(frame_paths) - 1, max_frames)
+            return [frame_paths[int(round(i))] for i in idxs]
+
+    return [input_path]
+
+
+def run_line_detector_on_image(image_path, debug_dir=None, write_debug_inputs=False):
+    img = cv2.imread(str(image_path))
+    if img is None:
+        return None
+
+    ignore_mask = build_static_ignore_mask(img.shape)
+    eq, gray, blur, edges, roi, edges_roi, white = preprocess(img, ignore_mask=ignore_mask)
     raw = detect_segments(edges_roi, img.shape)
     merged = merge_segments(raw, angle_thresh=4.0, dist_thresh=14, gap_thresh=28)
+
+    if debug_dir is not None and write_debug_inputs:
+        debug_dir = Path(debug_dir)
+        ensure_dir(debug_dir)
+        cv2.imwrite(str(debug_dir / "01_original.jpg"), img)
+        cv2.imwrite(str(debug_dir / "02_equalized.jpg"), eq)
+        cv2.imwrite(str(debug_dir / "03_gray.jpg"), gray)
+        cv2.imwrite(str(debug_dir / "04_edges.jpg"), edges)
+        cv2.imwrite(str(debug_dir / "05_roi.jpg"), roi)
+        cv2.imwrite(str(debug_dir / "06_edges_roi.jpg"), edges_roi)
+        cv2.imwrite(str(debug_dir / "07_white.jpg"), white)
+        cv2.imwrite(str(debug_dir / "08_raw_segments.jpg"), draw_segs(img, raw, (0, 255, 255), 2))
+        cv2.imwrite(str(debug_dir / "09_merged_segments.jpg"), draw_segs(img, merged, (255, 255, 0), 2))
 
     result = reconstruct_from_five_line_method(img, edges_roi, white, merged, debug_dir=debug_dir)
     if result is None:
-        return None
+        return {
+            "image_path": Path(image_path),
+            "img": img,
+            "raw_count": len(raw),
+            "merged_count": len(merged),
+            "result": None,
+            "cfg": None,
+            "valid": False,
+            "reason": "reconstruction_failed",
+        }
 
-    cfg = build_roi_config_from_result(image_source, img.shape, result)
+    try:
+        cfg = build_roi_config_from_result(image_path, img.shape, result)
+        valid, reason = validate_roi_config(cfg, img.shape)
+    except Exception as exc:
+        cfg = None
+        valid = False
+        reason = f"config_failed:{exc}"
 
-    if out_json is None:
-        out_json = paths["ROI_JSON"]
+    return {
+        "image_path": Path(image_path),
+        "img": img,
+        "raw_count": len(raw),
+        "merged_count": len(merged),
+        "result": result,
+        "cfg": cfg,
+        "valid": valid,
+        "reason": reason,
+    }
 
-    out_json = Path(out_json)
-    ensure_dir(out_json.parent)
 
-    with open(out_json, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
+def roi_corner_distance(cfg_a, cfg_b):
+    a = np.asarray(cfg_a["ROI_POLY"], dtype=np.float32)
+    b = np.asarray(cfg_b["ROI_POLY"], dtype=np.float32)
+    if a.shape != b.shape:
+        return 1e9
+    return float(np.mean(np.linalg.norm(a - b, axis=1)))
 
-    return cfg
 
-# =========================================================
-# entry
-# =========================================================
-def main(input_path, output_dir=None):
-    paths = setup_detector_paths(input_path, output_dir=output_dir)
+def select_best_candidate(candidates):
+    valid = [c for c in candidates if c.get("valid") and c.get("cfg") is not None and c.get("result") is not None]
+    if not valid:
+        return None, [{
+            "frame": str(c.get("image_path", "")),
+            "valid": False,
+            "reason": c.get("reason", "unknown"),
+            "raw_segments": int(c.get("raw_count", 0)),
+            "merged_segments": int(c.get("merged_count", 0)),
+        } for c in candidates]
 
-    out_dir = paths["OUT_DIR"]
-    roi_json = paths["ROI_JSON"]
+    summary = []
+    for c in valid:
+        distances = [roi_corner_distance(c["cfg"], other["cfg"]) for other in valid if other is not c]
+        median_dist = float(np.median(distances)) if distances else 0.0
+        support = int(sum(d <= 24.0 for d in distances)) + 1
+        warning_count = len(c["result"].get("warnings", []))
+        adjusted_score = float(c["result"].get("score", 0.0)) - 0.75 * median_dist + 28.0 * support - 55.0 * warning_count
+        c["adjusted_score"] = adjusted_score
+        c["support"] = support
+        c["median_corner_distance"] = median_dist
+        summary.append({
+            "frame": str(c["image_path"]),
+            "valid": True,
+            "reason": c["reason"],
+            "score": float(c["result"].get("score", 0.0)),
+            "adjusted_score": adjusted_score,
+            "support": support,
+            "median_corner_distance": median_dist,
+            "raw_segments": int(c["raw_count"]),
+            "merged_segments": int(c["merged_count"]),
+            "line_sources": c["result"].get("line_sources", {}),
+            "warnings": c["result"].get("warnings", []),
+        })
 
-    ensure_dir(out_dir)
-    ensure_dir(roi_json.parent)
+    valid_ids = {id(c) for c in valid}
+    invalid_summary = [{
+        "frame": str(c["image_path"]),
+        "valid": False,
+        "reason": c.get("reason", "unknown"),
+        "raw_segments": int(c.get("raw_count", 0)),
+        "merged_segments": int(c.get("merged_count", 0)),
+    } for c in candidates if id(c) not in valid_ids]
 
-    img, image_source = read_image_or_first_frame(
-        paths["INPUT_PATH"],
-        frames_dir=paths["FRAMES_DIR"]
-    )
+    best = max(valid, key=lambda c: c["adjusted_score"])
+    return best, summary + invalid_summary
 
-    eq, gray, blur, edges, roi, edges_roi, white = preprocess(img)
-    raw = detect_segments(edges_roi, img.shape)
-    merged = merge_segments(raw, angle_thresh=4.0, dist_thresh=14, gap_thresh=28)
 
-    cv2.imwrite(str(out_dir / "01_original.jpg"), img)
-    cv2.imwrite(str(out_dir / "02_equalized.jpg"), eq)
-    cv2.imwrite(str(out_dir / "03_gray.jpg"), gray)
-    cv2.imwrite(str(out_dir / "04_edges.jpg"), edges)
-    cv2.imwrite(str(out_dir / "05_roi.jpg"), roi)
-    cv2.imwrite(str(out_dir / "06_edges_roi.jpg"), edges_roi)
-    cv2.imwrite(str(out_dir / "07_white.jpg"), white)
-    cv2.imwrite(str(out_dir / "08_raw_segments.jpg"), draw_segs(img, raw, (0, 255, 255), 2))
-    cv2.imwrite(str(out_dir / "09_merged_segments.jpg"), draw_segs(img, merged, (255, 255, 0), 2))
-
-    result = reconstruct_from_five_line_method(img, edges_roi, white, merged, debug_dir=out_dir)
-    if result is None:
-        print("Could not reconstruct court with five-line method.")
-        print(f"raw segments = {len(raw)}")
-        print(f"merged segments = {len(merged)}")
-        return
-
+def save_selected_debug_images(debug_dir, selected):
+    debug_dir = Path(debug_dir)
+    ensure_dir(debug_dir)
+    img = selected["img"]
+    result = selected["result"]
     group_vis = visualize_groups(img, result)
     five_vis = visualize_main_five(img, result)
 
@@ -1858,26 +2298,101 @@ def main(input_path, output_dir=None):
         net_top_line=net_top_line
     )
 
-    cv2.imwrite(str(out_dir / "10_groups.jpg"), group_vis)
-    cv2.imwrite(str(out_dir / "11_main_five_lines.jpg"), five_vis)
-    cv2.imwrite(str(out_dir / "12_main_roi.jpg"), result["main_roi"])
-    cv2.imwrite(str(out_dir / "13_projected_court.jpg"), court_vis)
-    cv2.imwrite(str(out_dir / "14_model_mask.jpg"), result["model_mask"])
-    cv2.imwrite(str(out_dir / "15_overlap_edges.jpg"), result["overlap_edges"])
-    cv2.imwrite(str(out_dir / "16_overlap_white.jpg"), result["overlap_white"])
+    cv2.imwrite(str(debug_dir / "10_groups.jpg"), group_vis)
+    cv2.imwrite(str(debug_dir / "11_main_five_lines.jpg"), five_vis)
+    cv2.imwrite(str(debug_dir / "12_main_roi.jpg"), result["main_roi"])
+    cv2.imwrite(str(debug_dir / "13_projected_court.jpg"), court_vis)
+    cv2.imwrite(str(debug_dir / "14_projected_model_debug.jpg"), court_vis)
+    cv2.imwrite(str(debug_dir / "14_model_mask.jpg"), result["model_mask"])
+    cv2.imwrite(str(debug_dir / "15_overlap_edges.jpg"), result["overlap_edges"])
+    cv2.imwrite(str(debug_dir / "16_overlap_white.jpg"), result["overlap_white"])
 
-    # 產生 dataset/<video_name>/roi_config.json
-    cfg = build_roi_config_from_result(image_source, img.shape, result)
+
+def detect_best_court(input_path, out_json=None, output_dir=None):
+    paths = setup_detector_paths(input_path, output_dir=output_dir)
+
+    debug_dir = paths["OUT_DIR"]
+    if output_dir is None and out_json is not None:
+        debug_dir = Path(out_json).parent / "court_detector_debug"
+    debug_dir = Path(debug_dir)
+    ensure_dir(debug_dir)
+
+    candidates_paths = collect_candidate_image_sources(paths["INPUT_PATH"], paths["FRAMES_DIR"])
+    candidates = []
+    for image_path in candidates_paths:
+        candidate = run_line_detector_on_image(image_path, debug_dir=None, write_debug_inputs=False)
+        if candidate is not None:
+            candidates.append(candidate)
+
+    selected, summary = select_best_candidate(candidates)
+    with open(debug_dir / "15_multiframe_candidates.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    if selected is None:
+        return None, None, debug_dir
+
+    selected = run_line_detector_on_image(selected["image_path"], debug_dir=debug_dir, write_debug_inputs=True)
+    if selected is None or selected["result"] is None:
+        return None, None, debug_dir
+
+    result = selected["result"]
+    result["frames_sampled"] = len(candidates)
+    result["selected_frame"] = str(selected["image_path"])
+    result["score"] = float(selected["result"].get("score", 0.0))
+
+    cfg = build_roi_config_from_result(selected["image_path"], selected["img"].shape, result)
+    valid, reason = validate_roi_config(cfg, selected["img"].shape)
+    if not valid:
+        result.setdefault("warnings", []).append(reason)
+        cfg = build_roi_config_from_result(selected["image_path"], selected["img"].shape, result)
+
+    save_selected_debug_images(debug_dir, selected)
+    with open(debug_dir / "16_selected_config_preview.json", "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+    return cfg, selected, debug_dir
+
+
+def auto_pick_roi(input_path, out_json=None, output_dir=None):
+    cfg, selected, debug_dir = detect_best_court(input_path, out_json=out_json, output_dir=output_dir)
+    if cfg is None:
+        return None
+
+    if out_json is None:
+        paths = setup_detector_paths(input_path, output_dir=output_dir)
+        out_json = paths["ROI_JSON"]
+
+    out_json = Path(out_json)
+    ensure_dir(out_json.parent)
+
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+    return cfg
+
+# =========================================================
+# entry
+# =========================================================
+def main(input_path, output_dir=None):
+    paths = setup_detector_paths(input_path, output_dir=output_dir)
+    roi_json = paths["ROI_JSON"]
+
+    ensure_dir(roi_json.parent)
+
+    cfg, selected, out_dir = detect_best_court(input_path, output_dir=output_dir)
+    if cfg is None or selected is None:
+        print("Could not reconstruct court with five-line method.")
+        return
 
     with open(roi_json, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
     print(f"Done. debug saved to {out_dir}")
     print(f"roi_config saved to {roi_json}")
-    print(f"image source = {image_source}")
-    print(f"raw segments = {len(raw)}")
-    print(f"merged segments = {len(merged)}")
-    print(f"score = {result['score']:.3f}")
+    print(f"image source = {selected['image_path']}")
+    print(f"raw segments = {selected['raw_count']}")
+    print(f"merged segments = {selected['merged_count']}")
+    print(f"score = {selected['result']['score']:.3f}")
 
 
 if __name__ == "__main__":

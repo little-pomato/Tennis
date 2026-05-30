@@ -59,7 +59,10 @@ def load_bounce_events(path: Path, coord_scale: float = 1.0) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"bounce_events.csv not found: {path}")
 
-    raw = pd.read_csv(path)
+    try:
+        raw = pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame(columns=["frame_idx", "x", "y", "court_side", "score"])
     if raw.empty:
         return pd.DataFrame(columns=["frame_idx", "x", "y", "court_side", "score"])
 

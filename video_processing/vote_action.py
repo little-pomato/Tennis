@@ -92,10 +92,15 @@ def resolve_event_file(paths: Dict[str, Path], event_file: Optional[str]) -> Pat
         paths["events_bounce"],
     ]
     for p in candidates:
-        if p.exists():
-            return p
+        if p.exists() and p.stat().st_size > 0:
+            try:
+                df = pd.read_csv(p, nrows=1)
+                if len(df.columns) > 0:
+                    return p
+            except Exception:
+                continue
     raise FileNotFoundError(
-        "No event CSV found. Expected one of: "
+        "No non-empty event CSV found. Expected one of: "
         + ", ".join(str(p) for p in candidates)
     )
 

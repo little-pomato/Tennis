@@ -132,7 +132,12 @@ def _read_csv(path: Path, name: str, required: bool = True) -> pd.DataFrame:
         if required:
             raise FileNotFoundError(f"{name} not found: {path}")
         return pd.DataFrame()
-    return pd.read_csv(path)
+    try:
+        return pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        if required:
+            raise FileNotFoundError(f"{name} exists but is empty: {path}")
+        return pd.DataFrame()
 
 
 def _first_col(df: pd.DataFrame, names: List[str]) -> Optional[str]:

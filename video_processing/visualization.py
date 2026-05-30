@@ -9,6 +9,37 @@ import pandas as pd
 from tqdm import tqdm
 
 # ============================================================
+# Debug overlay helpers — projects court model lines back onto
+# the original video using H (court-model meters -> image px).
+# ============================================================
+
+# Court model line segments: list of ((X0,Y0),(X1,Y1)) in court meters
+def _court_model_segments() -> List[Tuple[Tuple[float, float], Tuple[float, float]]]:
+    W, L = COURT_WIDTH, COURT_LENGTH
+    SM = SINGLE_MARGIN
+    SW = SINGLES_WIDTH
+    NY = COURT_LENGTH / 2.0
+    SF = SERVICE_FROM_NET
+    segs = [
+        # doubles outer boundary
+        ((0, 0),   (W, 0)),
+        ((W, 0),   (W, L)),
+        ((W, L),   (0, L)),
+        ((0, L),   (0, 0)),
+        # singles sidelines
+        ((SM,     0), (SM,     L)),
+        ((SM+SW,  0), (SM+SW,  L)),
+        # near/far service lines
+        ((SM,    NY-SF), (SM+SW, NY-SF)),
+        ((SM,    NY+SF), (SM+SW, NY+SF)),
+        # center service line
+        ((W/2,   NY-SF), (W/2,   NY+SF)),
+        # net (drawn separately as dashed, but listed here for projection)
+        ((0, NY), (W, NY)),
+    ]
+    return segs
+
+# ============================================================
 # Clean bounce landing visualization
 # ------------------------------------------------------------
 # Default sync source is dataset/<video>/frames, because bounce.py also
@@ -390,40 +421,305 @@ def make_overlay_bounce_landings(
     print(f"[DONE] overlay saved -> {out_path}")
 
 
+def _court_pt_to_image(X: float, Y: float, H: np.ndarray) -> Optional[Tuple[int, int]]:
+    """Project one court-model point (meters) to image pixels using H directly."""
+    pts = np.array([[[float(X), float(Y)]]], dtype=np.float32)
+    out = cv2.perspectiveTransform(pts, H.astype(np.float64))
+    if out is None:
+        return None
+    px, py = float(out[0, 0, 0]), float(out[0, 0, 1])
+    if not (np.isfinite(px) and np.isfinite(py)):
+        return None
+    return int(round(px)), int(round(py))
+
+
+def draw_court_lines_on_frame(
+    frame: np.ndarray,
+    H: np.ndarray,
+    line_color: Tuple[int, int, int] = (0, 230, 0),
+    net_color: Tuple[int, int, int] = (200, 200, 200),
+    alpha: float = 0.55,
+) -> np.ndarray:
+    """Project court model lines onto the video frame using H.
+
+    Draws semi-transparently so the underlying image shows through.
+    This lets you verify that the projected court grid aligns with
+    the real painted lines in the video.
+    """
+    overlay = frame.copy()
+    H_arr = np.asarray(H, dtype=np.float64)
+    H_img, W_img = frame.shape[:2]
+    clip = (-W_img, -H_img, 2 * W_img, 2 * H_img)  # loose clip so lines near edges render
+
+    def _in_clip(p):
+        if p is None:
+            return False
+        return clip[0] <= p[0] <= clip[2] and clip[1] <= p[1] <= clip[3]
+
+    for (x0, y0), (x1, y1) in _court_model_segments():
+        p0 = _court_pt_to_image(x0, y0, H_arr)
+        p1 = _court_pt_to_image(x1, y1, H_arr)
+        if not (_in_clip(p0) and _in_clip(p1)):
+            continue
+        # Net drawn as a dashed line in a different colour
+        is_net = (y0 == COURT_LENGTH / 2.0 and y1 == COURT_LENGTH / 2.0)
+        color = net_color if is_net else line_color
+        thickness = 2 if is_net else 1
+        if is_net:
+            # dashed
+            total = int(np.hypot(p1[0] - p0[0], p1[1] - p0[1]))
+            n_dashes = max(1, total // 14)
+            for k in range(n_dashes):
+                t0 = k / n_dashes
+                t1 = (k + 0.55) / n_dashes
+                s = (int(round(p0[0] + t0 * (p1[0] - p0[0]))),
+                     int(round(p0[1] + t0 * (p1[1] - p0[1]))))
+                e = (int(round(p0[0] + t1 * (p1[0] - p0[0]))),
+                     int(round(p0[1] + t1 * (p1[1] - p0[1]))))
+                cv2.line(overlay, s, e, color, thickness, cv2.LINE_AA)
+        else:
+            cv2.line(overlay, p0, p1, color, thickness, cv2.LINE_AA)
+
+    return cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0)
+
+
+def draw_bounces_on_frame(
+    frame: np.ndarray,
+    accumulated: List[dict],
+    current_frame_idx: int,
+    trail_length: int = 10,
+) -> np.ndarray:
+    """Draw bounce markers directly on the video frame.
+
+    - Current frame's bounce: large crosshair + concentric rings + label.
+    - Last `trail_length` previous bounces: fading dots.
+    """
+    out = frame.copy()
+    H_img, W_img = frame.shape[:2]
+
+    # Only keep the most recent trail_length bounces before current frame
+    past = [b for b in accumulated if int(b["frame_idx"]) < current_frame_idx]
+    past = past[-trail_length:]
+
+    # Fading trail
+    for i, b in enumerate(past):
+        fade = (i + 1) / (len(past) + 1)   # 0→1 as we approach current
+        bx, by = int(round(float(b["x"]))), int(round(float(b["y"])))
+        if not (0 <= bx < W_img and 0 <= by < H_img):
+            continue
+        radius = max(3, int(round(4 * fade)))
+        in_b = bool(b.get("in_bound", True))
+        base_color = side_color(b.get("court_side", "unknown"), in_bound=in_b)
+        # Dim the colour by fade factor
+        color = tuple(int(c * fade) for c in base_color)
+        cv2.circle(out, (bx, by), radius, color, -1, cv2.LINE_AA)
+        cv2.circle(out, (bx, by), radius + 1, (30, 30, 30), 1, cv2.LINE_AA)
+
+    # Current-frame bounce: full crosshair + rings + label
+    cur_bounces = [b for b in accumulated if int(b["frame_idx"]) == current_frame_idx]
+    for b in cur_bounces:
+        bx, by = int(round(float(b["x"]))), int(round(float(b["y"])))
+        if not (0 <= bx < W_img and 0 <= by < H_img):
+            continue
+        in_b = bool(b.get("in_bound", True))
+        main_color = side_color(b.get("court_side", "unknown"), in_bound=in_b)
+        out_label = "IN" if in_b else "OUT"
+        out_color = (0, 200, 50) if in_b else (0, 60, 220)
+
+        # Cross-hair arms
+        arm = 18
+        cv2.line(out, (bx - arm, by), (bx + arm, by), main_color, 2, cv2.LINE_AA)
+        cv2.line(out, (bx, by - arm), (bx, by + arm), main_color, 2, cv2.LINE_AA)
+        # Concentric rings
+        cv2.circle(out, (bx, by), 6,  main_color,     -1, cv2.LINE_AA)
+        cv2.circle(out, (bx, by), 10, (255, 255, 255),  1, cv2.LINE_AA)
+        cv2.circle(out, (bx, by), 16, (30,  30,  30),   1, cv2.LINE_AA)
+
+        # Text label — two lines: "# score" and "SIDE IN/OUT"
+        score_str = f"{float(b.get('score', 0)):.2f}" if pd.notna(b.get("score", float("nan"))) else "--"
+        lbl_top = f"#{int(b.get('landing_no', 0))}  s={score_str}"
+        lbl_bot = f"{str(b.get('court_side','?')).upper()}  {out_label}"
+
+        tx, ty = bx + 18, by - 10
+        for dx, dy in ((-1, -1), (1, -1), (-1, 1), (1, 1)):
+            cv2.putText(out, lbl_top, (tx + dx, ty + dy), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 0),   2, cv2.LINE_AA)
+            cv2.putText(out, lbl_bot, (tx + dx, ty + dy + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 0), 2, cv2.LINE_AA)
+        cv2.putText(out, lbl_top, (tx, ty),      cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(out, lbl_bot, (tx, ty + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.52, out_color,       1, cv2.LINE_AA)
+
+    return out
+
+
+def make_debug_video_overlay(
+    video_path: Path,
+    frames_dir: Path,
+    bounce_csv: Path,
+    roi_json: Path,
+    out_path: Path,
+    bounce_coord_scale: float = 1.0,
+    trail_length: int = 10,
+    source: str = "frames",
+    fps: Optional[float] = None,
+    draw_court: bool = True,
+    court_alpha: float = 0.55,
+):
+    """Write a debug video with bounce markers and projected court lines drawn
+    directly on the original footage — no side-by-side 2D diagram.
+
+    Use this to verify that the court boundary (projected from H) aligns with
+    the real painted lines in the video.  If they don't align, the homography H
+    needs to be recalibrated via court_detector.auto_pick_roi().
+    """
+    video_path  = Path(video_path)
+    frames_dir  = Path(frames_dir)
+    bounce_csv  = Path(bounce_csv)
+    roi_json    = Path(roi_json)
+    out_path    = Path(out_path)
+
+    bounce_df = load_bounce_events(bounce_csv, coord_scale=bounce_coord_scale)
+    H = load_homography_from_roi(roi_json)
+    landing_df = project_all_landings(bounce_df, H)
+
+    print(f"[INFO] loaded bounce events: {len(bounce_df)}")
+    print(f"[INFO] projected landings:   {len(landing_df)}")
+
+    # Build lookup: frame_idx -> list of dicts with pixel coords + projected court coords
+    pixel_by_frame: Dict[int, List[dict]] = {}
+    bounce_by_idx = {int(r["frame_idx"]): r for _, r in bounce_df.iterrows()}
+    for _, row in landing_df.iterrows():
+        fi = int(row["frame_idx"])
+        brow = bounce_by_idx.get(fi, {})
+        entry = {
+            "frame_idx":  fi,
+            "x":          float(brow.get("x", row.get("X", 0))),
+            "y":          float(brow.get("y", row.get("Y", 0))),
+            "court_side": str(row.get("court_side", "unknown")),
+            "in_bound":   bool(row.get("in_bound", True)),
+            "score":      row.get("score", float("nan")),
+            "landing_no": int(row.get("landing_no", 0)),
+        }
+        pixel_by_frame.setdefault(fi, []).append(entry)
+
+    if fps is None or fps <= 0:
+        fps = get_video_fps(video_path, fallback=30.0) if video_path.exists() else 30.0
+
+    frame_files = get_frame_files(frames_dir)
+    use_frames = source == "frames"
+    if use_frames:
+        if not frame_files:
+            raise FileNotFoundError(f"No frames in {frames_dir}. Use --source video.")
+        first = cv2.imread(str(frame_files[0]))
+        H_img, W = first.shape[:2]
+        frame_iter = _frame_iter_from_images(frame_files)
+        total_frames = len(frame_files)
+    else:
+        cap = cv2.VideoCapture(str(video_path))
+        W     = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        H_img = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        frame_iter = _frame_iter_from_video(video_path)
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = cv2.VideoWriter(str(out_path), fourcc, float(fps), (W, H_img))
+    if not writer.isOpened():
+        raise RuntimeError(f"Cannot open VideoWriter: {out_path}")
+
+    H_arr = np.asarray(H, dtype=np.float64)
+    accumulated: List[dict] = []
+
+    for frame_idx, frame in tqdm(frame_iter, total=total_frames, desc="debug overlay"):
+        # 1. Project court lines onto the frame
+        vis = draw_court_lines_on_frame(frame, H_arr, alpha=court_alpha) if draw_court else frame.copy()
+
+        # 2. Accumulate new bounces
+        new_hits = pixel_by_frame.get(frame_idx, [])
+        accumulated.extend(new_hits)
+
+        # 3. Draw bounce markers
+        vis = draw_bounces_on_frame(vis, accumulated, frame_idx, trail_length=trail_length)
+
+        # 4. Frame counter in corner
+        cv2.putText(vis, f"f{frame_idx}", (8, H_img - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 0),   2, cv2.LINE_AA)
+        cv2.putText(vis, f"f{frame_idx}", (8, H_img - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (220, 220, 220), 1, cv2.LINE_AA)
+
+        writer.write(vis)
+
+    writer.release()
+    print(f"[DONE] debug overlay saved -> {out_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Create a clean video with only synchronized bounce landings on a side court."
+        description="Create a bounce landing video.  Use --mode debug to overlay "
+                    "bounce markers and court lines directly on the original footage."
     )
     parser.add_argument("video_path", type=str, help="例如 raw_videos/testVid.mp4")
-    parser.add_argument("--frames-dir", type=str, default=None, help="預設讀 dataset/<video>/frames，與 bounce.py 的 frame_idx 對齊")
-    parser.add_argument("--bounce-csv", type=str, default=None, help="預設讀 dataset/<video>/bounce_detector/bounce_events.csv")
-    parser.add_argument("--roi-json", type=str, default=None, help="預設讀 dataset/<video>/roi_config.json")
-    parser.add_argument("--out-overlay", type=str, default=None, help="輸出影片路徑")
-    parser.add_argument("--bounce-coord-scale", type=float, default=1.0, help="若 bounce.py 用 --scale 0.5 跑，這裡填 2.0")
+    parser.add_argument(
+        "--mode", choices=["overlay", "debug"], default="overlay",
+        help=(
+            "overlay (default): original video + 2D court diagram side-by-side. "
+            "debug: bounce markers + projected court lines drawn ON the video — "
+            "use this to check that the court lines align with the real painted lines."
+        ),
+    )
+    parser.add_argument("--frames-dir", type=str, default=None)
+    parser.add_argument("--bounce-csv", type=str, default=None)
+    parser.add_argument("--roi-json", type=str, default=None)
+    parser.add_argument("--out-overlay", type=str, default=None, help="Output video path")
+    parser.add_argument("--bounce-coord-scale", type=float, default=1.0,
+                        help="Set to 2.0 when bounce.py was run with --scale 0.5")
+    # overlay-mode options
     parser.add_argument("--court-scale", type=float, default=10.0)
     parser.add_argument("--court-margin", type=float, default=0.10)
     parser.add_argument("--court-ratio", type=float, default=0.35)
-    parser.add_argument("--show-index", action="store_true", help="在右側落點旁顯示序號")
-    parser.add_argument("--source", choices=["frames", "video"], default="frames", help="預設 frames，才能跟 bounce_events.csv 的 frame_idx 完全同步")
-    parser.add_argument("--fps", type=float, default=None, help="輸出 FPS；預設讀原影片 FPS")
+    parser.add_argument("--show-index", action="store_true")
+    # debug-mode options
+    parser.add_argument("--trail-length", type=int, default=10,
+                        help="How many previous bounces to show as fading dots (debug mode)")
+    parser.add_argument("--court-alpha", type=float, default=0.55,
+                        help="Opacity of projected court lines 0–1 (debug mode)")
+    parser.add_argument("--no-court-lines", action="store_true",
+                        help="Skip projected court lines (debug mode)")
+    parser.add_argument("--source", choices=["frames", "video"], default="frames")
+    parser.add_argument("--fps", type=float, default=None)
     args = parser.parse_args()
 
     set_video_path(Path(args.video_path))
 
-    make_overlay_bounce_landings(
-        video_path=Path(args.video_path),
-        frames_dir=Path(args.frames_dir) if args.frames_dir else FRAMES_DIR,
-        bounce_csv=Path(args.bounce_csv) if args.bounce_csv else BOUNCE_EVENTS_CSV,
-        roi_json=Path(args.roi_json) if args.roi_json else ROI_JSON,
-        out_path=Path(args.out_overlay) if args.out_overlay else OUT_PATH_OVERLAY,
-        court_scale=args.court_scale,
-        court_margin=args.court_margin,
-        court_ratio=args.court_ratio,
-        bounce_coord_scale=args.bounce_coord_scale,
-        show_index=args.show_index,
-        source=args.source,
-        fps=args.fps,
-    )
+    if args.mode == "debug":
+        default_out = BOUNCE_DIR / "debug_bounce_overlay.mp4"
+        make_debug_video_overlay(
+            video_path=Path(args.video_path),
+            frames_dir=Path(args.frames_dir) if args.frames_dir else FRAMES_DIR,
+            bounce_csv=Path(args.bounce_csv) if args.bounce_csv else BOUNCE_EVENTS_CSV,
+            roi_json=Path(args.roi_json) if args.roi_json else ROI_JSON,
+            out_path=Path(args.out_overlay) if args.out_overlay else default_out,
+            bounce_coord_scale=args.bounce_coord_scale,
+            trail_length=args.trail_length,
+            source=args.source,
+            fps=args.fps,
+            draw_court=not args.no_court_lines,
+            court_alpha=args.court_alpha,
+        )
+    else:
+        make_overlay_bounce_landings(
+            video_path=Path(args.video_path),
+            frames_dir=Path(args.frames_dir) if args.frames_dir else FRAMES_DIR,
+            bounce_csv=Path(args.bounce_csv) if args.bounce_csv else BOUNCE_EVENTS_CSV,
+            roi_json=Path(args.roi_json) if args.roi_json else ROI_JSON,
+            out_path=Path(args.out_overlay) if args.out_overlay else OUT_PATH_OVERLAY,
+            court_scale=args.court_scale,
+            court_margin=args.court_margin,
+            court_ratio=args.court_ratio,
+            bounce_coord_scale=args.bounce_coord_scale,
+            show_index=args.show_index,
+            source=args.source,
+            fps=args.fps,
+        )
 
 
 if __name__ == "__main__":

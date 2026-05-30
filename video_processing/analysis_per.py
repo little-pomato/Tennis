@@ -76,14 +76,22 @@ def project_to_court(x: float, y: float, H: np.ndarray) -> Tuple[float, float]:
     return float(out[0]), float(out[1])
 
 
-def is_in_bounds(X: float, Y: float, singles: bool = True, tol: float = 0.10) -> bool:
+def is_in_bounds(X: float, Y: float, singles: bool = True, tol: float = 0.3) -> bool:
+    """
+    Checks if a point (X, Y) in court meters is inside the lines.
+    Tennis rules state that if any part of the ball touches the line, it is IN.
+    Standard line width is 5cm (0.05m).
+    """
     width = SINGLES_WIDTH if singles else COURT_WIDTH
     x_min = (COURT_WIDTH - width) / 2.0
     x_max = x_min + width
+
+    # The tolerance (tol) represents the line width + ball radius + error margin.
     return (
         x_min - tol <= float(X) <= x_max + tol
         and 0.0 - tol <= float(Y) <= COURT_LENGTH + tol
     )
+
 
 
 def landing_side_from_y(Y: float) -> str:
@@ -486,6 +494,13 @@ def build_event_dataframe(bounces: pd.DataFrame, hits: pd.DataFrame, roi_json: P
 
     events = pd.DataFrame(hit_rows + bounce_rows)
     events = events.sort_values(["frame_idx", "is_hit"]).reset_index(drop=True)
+
+    # Re-calculate in_singles for bounces with explicit tolerance to ensure line-hits are IN.
+    # 0.3m (30cm) allows for line width + ball radius + projection drift.
+    bounce_mask = events["is_bounce"] == 1
+    events.loc[bounce_mask, "in_singles"] = events.loc[bounce_mask].apply(
+        lambda r: int(is_in_bounds(r["court_x"], r["court_y"], singles=True, tol=0.3)), axis=1
+    )
     return events
 
 
@@ -747,7 +762,7 @@ def plot_bounce_map_with_zones(stats: dict, view_side: str = "near", scale: floa
     ax.text(fx + 4, fy, f"Front {stats['front']:.1f}%", color="green", ha="center", va="center")
     ax.text(bx + 4, by, f"Back {stats['back']:.1f}%", color="#e76d0a", ha="center", va="center")
 
-    colors = ["black" if is_in_bounds(Xc, Yc, singles=True) else "gray" for Xc, Yc in xy]
+    colors = ["black" if is_in_bounds(Xc, Yc, singles=True, tol=0.3) else "gray" for Xc, Yc in xy]
     xs = xy[:, 0] * scale + margin_px
     ys = xy[:, 1] * scale + margin_px
     ax.scatter(xs, ys, c=colors, s=20)

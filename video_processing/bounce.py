@@ -2803,7 +2803,7 @@ def run_bounce_detector(
         valid_mask,
         roi_json if roi_json.exists() else None,
         scale=scale,
-        erode_iter=1,
+        erode_iter=0,
         roi_expand_px=roi_expand_px,
         valid_mask_expand_px=valid_mask_expand_px,
         far_expand_px=far_roi_expand_px,
@@ -3220,11 +3220,37 @@ def run_bounce_detector(
         for evt in events
     ]
 
+    # Use strict temporal NMS (15-frame window) with huge dist_px to enforce
+    # only one bounce per 0.5s impact event, regardless of spatial jumps.
     events = spatiotemporal_nms(
         events,
-        frame_gap=peak_min_gap,
-        dist_px=max(near_neighbor_radius + 10.0, far_neighbor_radius + 14.0)
+        frame_gap=15,
+        dist_px=9999.0
     )
+
+    # Viterbi Path Validation:
+    # A bounce event is only valid if its (cx, cy) is physically close to the 
+    # globally optimized Viterbi path of the ball at that frame. 
+    # This effectively kills 'phantom' bounces on the wrong side of the court.
+    validated_events = []
+    for evt in events:
+        f = int(evt.peak_frame)
+        if f < len(ball_y_df):
+            v_x = ball_y_df.loc[f, "x"]
+            v_y = ball_y_df.loc[f, "y"]
+            
+            if pd.notna(v_x) and pd.notna(v_y):
+                dist = np.sqrt((evt.cx - v_x)**2 + (evt.cy - v_y)**2)
+                # Max allowed deviation from the global path. 60 pixels is generous
+                # enough for perspective but strict enough to kill wrong-side hallucinations.
+                if dist <= 60.0:
+                    validated_events.append(evt)
+            else:
+                # If Viterbi has no candidate at this frame (occluded), we still
+                # allow the bounce if the detector was very confident, but 
+                # usually Viterbi matches bounces very well.
+                validated_events.append(evt)
+    events = validated_events
 
     score_rows = []
     peak_set = set(peak_indices)

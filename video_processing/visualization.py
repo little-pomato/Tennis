@@ -163,7 +163,7 @@ def image_to_court_xy(x: float, y: float, H_court_to_image: np.ndarray) -> Optio
     return X, Y
 
 
-def is_in_bounds(X: float, Y: float, singles: bool = True, tol: float = 0.03) -> bool:
+def is_in_bounds(X: float, Y: float, singles: bool = True, tol: float = 0.3) -> bool:
     width = SINGLES_WIDTH if singles else COURT_WIDTH
     x_min = (COURT_WIDTH - width) / 2.0
     x_max = x_min + width

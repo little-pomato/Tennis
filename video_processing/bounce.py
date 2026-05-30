@@ -379,15 +379,30 @@ def build_player_exclusion_masks_with_tracker(
         soft_pad_w = max(4, int(bw * soft_ratio))
         soft_pad_h = max(4, int(bh * soft_ratio))
 
+        # Vertical padding is asymmetric for near-side players:
+        #   - Upward: racket arm is held above the player's head bbox.
+        #   - Downward: shoes/feet slide far below the bbox on lunges.
+        # Far-side stays symmetric (smaller perspective, less critical).
+        if not is_far:
+            soft_pad_up   = max(soft_pad_h, int(bh * 0.35))
+            soft_pad_down = max(soft_pad_h, int(bh * 0.50))
+            core_pad_up   = core_pad_h
+            core_pad_down = max(core_pad_h, int(bh * 0.12))
+        else:
+            soft_pad_up   = soft_pad_h
+            soft_pad_down = soft_pad_h
+            core_pad_up   = core_pad_h
+            core_pad_down = core_pad_h
+
         cx1 = max(0, int(x1) - core_pad_w)
-        cy1 = max(0, int(y1) - core_pad_h)
+        cy1 = max(0, int(y1) - core_pad_up)
         cx2 = min(W - 1, int(x2) + core_pad_w)
-        cy2 = min(H - 1, int(y2) + core_pad_h)
+        cy2 = min(H - 1, int(y2) + core_pad_down)
 
         sx1 = max(0, int(x1) - soft_pad_w)
-        sy1 = max(0, int(y1) - soft_pad_h)
+        sy1 = max(0, int(y1) - soft_pad_up)
         sx2 = min(W - 1, int(x2) + soft_pad_w)
-        sy2 = min(H - 1, int(y2) + soft_pad_h)
+        sy2 = min(H - 1, int(y2) + soft_pad_down)
 
         if sx2 > sx1 and sy2 > sy1:
             cv2.rectangle(soft_mask, (sx1, sy1), (sx2, sy2), 255, -1)
@@ -454,6 +469,7 @@ def extract_blob_candidates(
 
     inter_pixels = int(np.count_nonzero(fg_inter))
     union_pixels = int(np.count_nonzero(fg_union))
+    H, W = fg_inter.shape[:2]
 
     # fg_inter 太稀疏時，混入 fg_union
     if inter_pixels <= 6 or (union_pixels > 0 and inter_pixels / max(1, union_pixels) < 0.18):
@@ -465,12 +481,25 @@ def extract_blob_candidates(
     diff_mix = ((diff_prev.astype(np.float32) + diff_next.astype(np.float32)) * 0.5).astype(np.uint8)
 
     for cnt in cnts:
+        # Perspective-aware area scaling: 
+        # Objects at the top of the image (small Y) are smaller.
+        x, y, w, h = cv2.boundingRect(cnt)
+        y_ratio = y / H
+        scale = 0.2 + 0.8 * y_ratio
+        
+        scaled_min_area = max(1, min_area * scale)
+        scaled_max_area = max_area * scale
+        scaled_max_wh = max_wh * np.sqrt(scale)
+
         area = cv2.contourArea(cnt)
-        if area < min_area or area > max_area:
+        if area < scaled_min_area or area > scaled_max_area:
             continue
 
-        x, y, w, h = cv2.boundingRect(cnt)
-        if w <= 0 or h <= 0 or w > max_wh or h > max_wh:
+        if w <= 0 or h <= 0 or w > scaled_max_wh or h > scaled_max_wh:
+            continue
+        # Reject elongated blobs: a tennis ball is roughly circular.
+        # Racket edges, arm/leg silhouettes, and shoe outlines are elongated.
+        if float(max(w, h)) / float(min(w, h)) > 3.5:
             continue
 
         M = cv2.moments(cnt)
@@ -906,6 +935,23 @@ def score_bounce_events(
                     - 0.04 * cand.net_penalty
                 )
             cand.score_event = max(0.0, cand.score_event)
+
+            # Direction-of-motion sanity check:
+            # A real bounce must show the ball falling TOWARD the court before impact
+            # and rising AWAY after.  In image coords (y↓):
+            #   near side: ball falls → prev_dy > 0 then rises → next_dy < 0
+            #   far  side: ball falls → prev_dy < 0 then rises → next_dy > 0
+            # A serve toss apex is exactly the reverse — penalise it heavily.
+            # Only apply when both neighbors are found and steps are non-trivial
+            # (avoids noisy direction on nearly-stationary blobs).
+            if (prev_c is not None and next_c is not None
+                    and cand.prev_step > 3.0 and cand.next_step > 3.0):
+                if cand.court_side == "near":
+                    serve_toss_pattern = (cand.prev_dy < 0 and cand.next_dy > 0)
+                else:
+                    serve_toss_pattern = (cand.prev_dy > 0 and cand.next_dy < 0)
+                if serve_toss_pattern:
+                    cand.score_event *= 0.35
 
             if cand.is_interpolated == 1:
                 cand.score_event *= 0.72
@@ -2932,8 +2978,8 @@ def run_bounce_detector(
             net_penalty_radius=net_penalty_radius,
             net_penalty_weight=net_penalty_weight,
             human_dist_map=human_dist_map,
-            human_penalty_radius=18.0,
-            human_penalty_weight=0.28,
+            human_penalty_radius=35.0,   # extended from 18 → 35 px; gradual fade zone
+            human_penalty_weight=0.45,   # stronger suppression near player body
         )
         candidates_by_frame[i] = frame_cands
 
@@ -2990,6 +3036,7 @@ def run_bounce_detector(
     # ========================================================
     ball_y_df = build_ball_y_signal_from_candidates(
         candidates_by_frame=candidates_by_frame,
+        img_h=target_hw[0],
         max_interp_gap=12,
         smooth_win=5,
     )

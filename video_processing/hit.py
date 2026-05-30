@@ -7,6 +7,15 @@ import pandas as pd
 from scipy.signal import savgol_filter
 
 
+def _node_score(c: BlobCandidate) -> float:
+    return float(
+        0.45 * c.score_event
+        + 0.30 * c.score_blob
+        + 0.15 * c.track_score_1
+        + 0.10 * c.track_score_2
+    )
+
+
 def _best_candidate_for_y_signal(cands: List[BlobCandidate]) -> Optional[BlobCandidate]:
     """
     每幀挑一顆最像球的 candidate，建立 y signal 用。
@@ -15,32 +24,127 @@ def _best_candidate_for_y_signal(cands: List[BlobCandidate]) -> Optional[BlobCan
     if not cands:
         return None
 
-    def score(c: BlobCandidate) -> float:
-        return float(
-            0.45 * c.score_event
-            + 0.30 * c.score_blob
-            + 0.15 * c.track_score_1
-            + 0.10 * c.track_score_2
-        )
+    return max(cands, key=_node_score)
 
-    return max(cands, key=score)
+
+def _viterbi_path(
+    candidates_by_frame: List[List[BlobCandidate]],
+    img_h: int,
+    max_pixel_speed: float = 140.0,
+    max_gap: int = 15,
+    missing_penalty: float = 0.6,
+    dist_penalty_weight: float = 0.002,
+) -> List[Optional[BlobCandidate]]:
+    """
+    Use Viterbi/Dynamic Programming to find the globally optimal ball path.
+    This prevents 'teleportation' to false positives by enforcing a max pixel speed.
+    """
+    n = len(candidates_by_frame)
+    if n == 0:
+        return []
+
+    # dp[t][j] = max accumulated score ending at frame t, candidate j
+    # backpointer[t][j] = (prev_frame_idx, prev_cand_idx)
+    dp = [[] for _ in range(n)]
+    backpointers = [[] for _ in range(n)]
+
+    for t in range(n):
+        cands = candidates_by_frame[t]
+        num_cands = len(cands)
+        dp[t] = [-1e9] * num_cands
+        backpointers[t] = [(-1, -1)] * num_cands
+
+        for j in range(num_cands):
+            cj = cands[j]
+            node_score = _node_score(cj)
+            
+            # Initial score if this candidate starts the path
+            # We penalize starting late in the video
+            dp[t][j] = node_score - t * missing_penalty
+            
+            # Look back through recent frames to find the best predecessor
+            for gap in range(1, max_gap + 1):
+                prev_t = t - gap
+                if prev_t < 0:
+                    break
+                
+                prev_cands = candidates_by_frame[prev_t]
+                for i in range(len(prev_cands)):
+                    ci = prev_cands[i]
+                    
+                    dx = cj.cx - ci.cx
+                    dy = cj.cy - ci.cy
+                    dist = np.sqrt(dx*dx + dy*dy)
+                    
+                    # Perspective-aware speed constraint: 
+                    # Far court (small Y) moves fewer pixels than near court (large Y).
+                    y_ratio = min(1.0, max(0.0, ci.cy / img_h))
+                    speed_scale = 0.3 + 0.7 * y_ratio
+                    scaled_max_speed = max_pixel_speed * speed_scale
+                    
+                    # Physical constraint: ball cannot teleport
+                    if dist > gap * scaled_max_speed:
+                        continue
+                    
+                    # Accumulate score: 
+                    # prev_score + current_node_score - gap_penalty - distance_smoothness_penalty
+                    # (gap-1) frames were missing between prev_t and t
+                    transition_score = (
+                        dp[prev_t][i] 
+                        + node_score 
+                        - (gap - 1) * missing_penalty 
+                        - dist * dist_penalty_weight
+                    )
+                    
+                    if transition_score > dp[t][j]:
+                        dp[t][j] = transition_score
+                        backpointers[t][j] = (prev_t, i)
+
+    # Find the best ending candidate across the entire video
+    best_t = -1
+    best_j = -1
+    max_total_score = -1e9
+    
+    for t in range(n):
+        for j in range(len(dp[t])):
+            # Favor paths that cover more of the video
+            final_score = dp[t][j] - (n - 1 - t) * missing_penalty
+            if final_score > max_total_score:
+                max_total_score = final_score
+                best_t = t
+                best_j = j
+
+    # Reconstruct the optimal path by backtracking
+    path = [None] * n
+    curr_t, curr_j = best_t, best_j
+    while curr_t != -1:
+        path[curr_t] = candidates_by_frame[curr_t][curr_j]
+        curr_t, curr_j = backpointers[curr_t][curr_j]
+        
+    return path
 
 
 def build_ball_y_signal_from_candidates(
     candidates_by_frame: List[List[BlobCandidate]],
+    img_h: int = 1080,
     max_interp_gap: int = 12,
     smooth_win: int = 5,
 ) -> pd.DataFrame:
     """
     從 candidates_by_frame 建立每幀球的 y 軌跡。
-    有 candidate 就用真實 candidate；
-    沒 candidate 就先留 NaN，再用 interpolate 補短 gap。
+    使用 Viterbi 演算法尋找物理上最合理的全局路徑，避免瞬間移動。
     """
+    # 1. 取得全局最佳路徑
+    best_path = _viterbi_path(
+        candidates_by_frame,
+        img_h=img_h,
+        max_pixel_speed=140.0,
+        max_gap=max_interp_gap + 2,
+        missing_penalty=0.6,
+    )
+
     rows = []
-
-    for i, cands in enumerate(candidates_by_frame):
-        best = _best_candidate_for_y_signal(cands)
-
+    for i, best in enumerate(best_path):
         if best is None:
             rows.append({
                 "frame_idx": i,
@@ -49,24 +153,17 @@ def build_ball_y_signal_from_candidates(
                 "has_candidate": 0,
                 "candidate_score": 0.0,
                 "court_side": "missing",
-                "n_candidates": len(cands),
+                "n_candidates": len(candidates_by_frame[i]),
             })
         else:
-            candidate_score = float(
-                0.45 * best.score_event
-                + 0.30 * best.score_blob
-                + 0.15 * best.track_score_1
-                + 0.10 * best.track_score_2
-            )
-
             rows.append({
                 "frame_idx": i,
                 "x": float(best.cx),
                 "y": float(best.cy),
                 "has_candidate": 1,
-                "candidate_score": candidate_score,
+                "candidate_score": _node_score(best),
                 "court_side": str(best.court_side),
-                "n_candidates": len(cands),
+                "n_candidates": len(candidates_by_frame[i]),
             })
 
     df = pd.DataFrame(rows)

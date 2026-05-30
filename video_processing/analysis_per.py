@@ -76,7 +76,7 @@ def project_to_court(x: float, y: float, H: np.ndarray) -> Tuple[float, float]:
     return float(out[0]), float(out[1])
 
 
-def is_in_bounds(X: float, Y: float, singles: bool = True, tol: float = 0.03) -> bool:
+def is_in_bounds(X: float, Y: float, singles: bool = True, tol: float = 0.10) -> bool:
     width = SINGLES_WIDTH if singles else COURT_WIDTH
     x_min = (COURT_WIDTH - width) / 2.0
     x_max = x_min + width
@@ -933,7 +933,10 @@ def plot_stroke_landing_map(events: pd.DataFrame, view_side: str = "near", only_
     bounces = bounces[bounces["player_view"].astype(str).str.lower() == view_side].copy()
     if only_opponent_half:
         bounces = bounces[bounces["court_y"].apply(lambda y: _is_opponent_half_for_view(view_side, y))]
-    bounces["linked_stroke_label"] = bounces.get("linked_stroke_label", "unknown").astype(str).str.lower()
+    if "linked_stroke_label" in bounces.columns:
+        bounces["linked_stroke_label"] = bounces["linked_stroke_label"].astype(str).str.lower()
+    else:
+        bounces["linked_stroke_label"] = "unknown"
     bounces = bounces[bounces["linked_stroke_label"].isin(["forehand", "backhand"])].copy()
 
     if bounces.empty:

@@ -1365,6 +1365,7 @@ def make_event_from_vote_peak(
     enable_side_arbitration: bool = True,
     side_conflict_check_radius: int = 1,
     side_look_radius: int = 5,
+    net_y: Optional[float] = None,
 ) -> Optional[BounceEvent]:
     start = max(0, peak_idx - window_radius)
     end = min(len(candidates_by_frame) - 1, peak_idx + window_radius)
@@ -1382,7 +1383,7 @@ def make_event_from_vote_peak(
         )
 
         if has_conflict:
-            chosen_side, _ = choose_side_by_temporal_context(
+            chosen_side, debug_info = choose_side_by_temporal_context(
                 candidates_by_frame,
                 peak_idx=peak_idx,
                 look_radius=side_look_radius,
@@ -1390,6 +1391,17 @@ def make_event_from_vote_peak(
                 far_neighbor_radius=far_refine_radius,
                 min_score_event=0.35,
             )
+            # Geometric sanity check: the anchor's pixel position is the strongest
+            # evidence for which side the ball is on.  Only let the temporal context
+            # override the geometry when it is at least 2× stronger — otherwise the
+            # anchor's own cy vs net_y wins the tiebreak.
+            if net_y is not None:
+                geo_side = classify_court_side(anchor.cy, net_y)
+                if geo_side != chosen_side:
+                    winning = debug_info["near_score"] if chosen_side == "near" else debug_info["far_score"]
+                    losing  = debug_info["far_score"]  if chosen_side == "near" else debug_info["near_score"]
+                    if winning < 2.0 * losing:
+                        chosen_side = geo_side
 
     # 關鍵：只回到 peak_idx 這一幀挑 candidate
     curr_cands = candidates_by_frame[peak_idx] if 0 <= peak_idx < len(candidates_by_frame) else []
@@ -1969,59 +1981,97 @@ def _collect_local_track(
         back_ref_x, back_ref_y = float(anchor_x), float(anchor_y)
         fwd_ref_x, fwd_ref_y = float(anchor_x), float(anchor_y)
 
+    # Running velocity estimates (last-two-points prediction).
+    # Searching around the predicted next position catches fast-moving balls that would
+    # fall outside a fixed-radius circle centered at the last match.
+    _MAX_SPEED_PX = 30.0  # cap to reject implausible jumps
+    back_vx: float = 0.0
+    back_vy: float = 0.0
+    fwd_vx: float = 0.0
+    fwd_vy: float = 0.0
+
     for j in range(peak_frame - 1, start - 1, -1):
+        pred_x = back_ref_x + back_vx
+        pred_y = back_ref_y + back_vy
         cand = _pick_track_candidate(
             candidates_by_frame[j],
-            back_ref_x,
-            back_ref_y,
+            pred_x,
+            pred_y,
             link_radius,
             allowed_side=allowed_side,
         )
         if cand is None:
             continue
         obs.append((j, float(cand.cx), float(cand.cy), float(max(cand.score_event, cand.score_blob))))
+        # velocity points backward (we're traversing in reverse)
+        new_vx = back_ref_x - float(cand.cx)
+        new_vy = back_ref_y - float(cand.cy)
+        if float(np.hypot(new_vx, new_vy)) <= _MAX_SPEED_PX:
+            back_vx, back_vy = new_vx, new_vy
         back_ref_x, back_ref_y = float(cand.cx), float(cand.cy)
 
     for j in range(peak_frame + 1, end + 1):
+        pred_x = fwd_ref_x + fwd_vx
+        pred_y = fwd_ref_y + fwd_vy
         cand = _pick_track_candidate(
             candidates_by_frame[j],
-            fwd_ref_x,
-            fwd_ref_y,
+            pred_x,
+            pred_y,
             link_radius,
             allowed_side=allowed_side,
         )
         if cand is None:
             continue
         obs.append((j, float(cand.cx), float(cand.cy), float(max(cand.score_event, cand.score_blob))))
+        new_vx = float(cand.cx) - fwd_ref_x
+        new_vy = float(cand.cy) - fwd_ref_y
+        if float(np.hypot(new_vx, new_vy)) <= _MAX_SPEED_PX:
+            fwd_vx, fwd_vy = new_vx, new_vy
         fwd_ref_x, fwd_ref_y = float(cand.cx), float(cand.cy)
 
     obs.sort(key=lambda z: z[0])
     return obs
 
 
-def _fit_line_xy(obs: List[Tuple[int, float, float, float]]) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+def _fit_parabola_xy(obs: List[Tuple[int, float, float, float]]) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """
+    Fit degree-1 poly for x(t) and degree-2 poly for y(t).
+    y is parabolic because gravity creates a quadratic arc in image coordinates.
+    Falls back to degree-1 for y when < 3 points or curvature is wildly ill-conditioned.
+    Returns (coef_x shape-(2,), coef_y shape-(3,)) both as float32.
+    """
     if len(obs) < 2:
         return None
-    t = np.array([o[0] for o in obs], dtype=np.float32)
+    t = np.array([o[0] for o in obs], dtype=np.float64)
     if float(np.max(t) - np.min(t)) < 1e-6:
         return None
-    x = np.array([o[1] for o in obs], dtype=np.float32)
-    y = np.array([o[2] for o in obs], dtype=np.float32)
-    w = np.array([max(1e-3, o[3]) for o in obs], dtype=np.float32)
-    try:
-        coef_x = np.polyfit(t, x, 1, w=w)
-        coef_y = np.polyfit(t, y, 1, w=w)
-    except Exception:
-        coef_x = np.polyfit(t, x, 1)
-        coef_y = np.polyfit(t, y, 1)
+    x = np.array([o[1] for o in obs], dtype=np.float64)
+    y = np.array([o[2] for o in obs], dtype=np.float64)
+    w = np.array([max(1e-3, o[3]) for o in obs], dtype=np.float64)
+
+    coef_x = np.polyfit(t, x, 1, w=w)  # shape (2,)
+
+    if len(obs) >= 3:
+        try:
+            coef_y = np.polyfit(t, y, 2, w=w)  # shape (3,): [a, b, c]
+            # Reject wildly ill-conditioned curvature (|a| > 5 px/frame² is physically impossible
+            # for a ball at standard broadcast resolution and 30 fps)
+            if abs(coef_y[0]) > 5.0:
+                lin = np.polyfit(t, y, 1, w=w)
+                coef_y = np.array([0.0, lin[0], lin[1]])
+        except Exception:
+            lin = np.polyfit(t, y, 1, w=w)
+            coef_y = np.array([0.0, lin[0], lin[1]])
+    else:
+        lin = np.polyfit(t, y, 1, w=w)
+        coef_y = np.array([0.0, lin[0], lin[1]])
+
     return coef_x.astype(np.float32), coef_y.astype(np.float32)
 
 
-def _predict_line_xy(fit: Tuple[np.ndarray, np.ndarray], t: float) -> Tuple[float, float]:
+def _predict_parabola_xy(fit: Tuple[np.ndarray, np.ndarray], t: float) -> Tuple[float, float]:
     coef_x, coef_y = fit
-    x = float(coef_x[0] * t + coef_x[1])
-    y = float(coef_y[0] * t + coef_y[1])
-    return x, y
+    return float(np.polyval(coef_x, t)), float(np.polyval(coef_y, t))
 
 
 def _estimate_track_bounce_point(
@@ -2035,8 +2085,8 @@ def _estimate_track_bounce_point(
     pre_obs = [o for o in obs if o[0] < peak_frame]
     post_obs = [o for o in obs if o[0] > peak_frame]
 
-    pre_fit = _fit_line_xy(pre_obs)
-    post_fit = _fit_line_xy(post_obs)
+    pre_fit = _fit_parabola_xy(pre_obs)
+    post_fit = _fit_parabola_xy(post_obs)
     if pre_fit is None or post_fit is None:
         return float(coarse_x), float(coarse_y), float(peak_frame), 0.0, len(pre_obs), len(post_obs)
 
@@ -2044,19 +2094,59 @@ def _estimate_track_bounce_point(
     t_hi = min(float(end), float(peak_frame) + 1.75)
     if t_hi <= t_lo:
         t_lo, t_hi = float(start), float(end)
-    t_grid = np.linspace(t_lo, t_hi, 31, dtype=np.float32)
 
-    best_t = float(peak_frame)
-    best_dist = 1e18
-    best_xy = (float(coarse_x), float(coarse_y))
-    for t in t_grid:
-        px1, py1 = _predict_line_xy(pre_fit, float(t))
-        px2, py2 = _predict_line_xy(post_fit, float(t))
-        d = float(np.hypot(px1 - px2, py1 - py2))
-        if d < best_dist:
-            best_dist = d
-            best_t = float(t)
-            best_xy = (0.5 * (px1 + px2), 0.5 * (py1 + py2))
+    # Analytical intersection of the two y-parabolas:
+    # pre_y(t) = a1*t^2 + b1*t + c1
+    # post_y(t) = a2*t^2 + b2*t + c2
+    # Solve (a1-a2)*t^2 + (b1-b2)*t + (c1-c2) = 0
+    a1, b1, c1 = float(pre_fit[1][0]), float(pre_fit[1][1]), float(pre_fit[1][2])
+    a2, b2, c2 = float(post_fit[1][0]), float(post_fit[1][1]), float(post_fit[1][2])
+    A, B, C = a1 - a2, b1 - b2, c1 - c2
+
+    best_t: float = float(peak_frame)
+    best_dist: float = 1e18
+    best_xy: Tuple[float, float] = (float(coarse_x), float(coarse_y))
+
+    candidate_ts: List[float] = []
+    if abs(A) < 1e-9 and abs(B) < 1e-9:
+        # Both parabolas are the same (or parallel) — distance is constant everywhere.
+        # The vote already chose peak_frame as the best estimate; honour it.
+        best_t = float(peak_frame)
+        px1, py1 = _predict_parabola_xy(pre_fit, best_t)
+        px2, py2 = _predict_parabola_xy(post_fit, best_t)
+        best_dist = float(np.hypot(px1 - px2, py1 - py2))
+        best_xy = (0.5 * (px1 + px2), 0.5 * (py1 + py2))
+    elif abs(A) < 1e-9:
+        # Degenerate to linear: B*t + C = 0
+        candidate_ts.append(-C / B)
+    else:
+        disc = B * B - 4.0 * A * C
+        if disc >= 0.0:
+            sq = float(np.sqrt(disc))
+            candidate_ts.append((-B + sq) / (2.0 * A))
+            candidate_ts.append((-B - sq) / (2.0 * A))
+
+    for t_cand in candidate_ts:
+        if t_lo <= t_cand <= t_hi:
+            px1, py1 = _predict_parabola_xy(pre_fit, t_cand)
+            px2, py2 = _predict_parabola_xy(post_fit, t_cand)
+            d = float(np.hypot(px1 - px2, py1 - py2))
+            if d < best_dist:
+                best_dist = d
+                best_t = t_cand
+                best_xy = (0.5 * (px1 + px2), 0.5 * (py1 + py2))
+
+    # Fall back to dense grid search when no analytical root fell in the valid window
+    if best_dist >= 1e17:
+        t_grid = np.linspace(t_lo, t_hi, 31, dtype=np.float64)
+        for t in t_grid:
+            px1, py1 = _predict_parabola_xy(pre_fit, float(t))
+            px2, py2 = _predict_parabola_xy(post_fit, float(t))
+            d = float(np.hypot(px1 - px2, py1 - py2))
+            if d < best_dist:
+                best_dist = d
+                best_t = float(t)
+                best_xy = (0.5 * (px1 + px2), 0.5 * (py1 + py2))
 
     track_score = float(np.clip(1.0 - best_dist / 12.0, 0.0, 1.0))
     return float(best_xy[0]), float(best_xy[1]), float(best_t), track_score, len(pre_obs), len(post_obs)
@@ -2208,9 +2298,17 @@ def refine_event_location_with_track_and_motion(
     event.cx = float(refined_x)
     event.cy = float(refined_y)
 
-    # 最終 side 與最終位置一致
+    # Re-check court side from the refined position, but require the ball to have
+    # clearly crossed net_y before flipping — a 1–2 px heatmap shift at the net must
+    # not override the side label that Stage 2 already validated.
     if net_y is not None:
-        event.court_side = "near" if refined_y >= float(net_y) else "far"
+        _FLIP_MARGIN = 8.0  # pixels — must be clearly past the net to reassign
+        cur_side = str(event.court_side)
+        if cur_side == "near" and refined_y < float(net_y) - _FLIP_MARGIN:
+            event.court_side = "far"
+        elif cur_side == "far" and refined_y >= float(net_y) + _FLIP_MARGIN:
+            event.court_side = "near"
+        # else: keep the side that Stage 2 validated
 
     event.peak_score = float(0.82 * event.peak_score + 0.18 * refine_score)
     return event
@@ -2312,9 +2410,14 @@ def stage2_validate_event_window(
     event_likeness_score = float(np.clip(event_likeness_score, 0.0, 1.0))
 
     keep_event = 1
-    if valid_count < 5:
+    # Far-side blobs are smaller under perspective compression, so fewer frames will
+    # show a detectable candidate in the ±7-frame window.  Require fewer valid frames.
+    min_valid = 3 if chosen_side == "far" else 5
+    if valid_count < min_valid:
         keep_event = 0
-    if side_consistency < 0.60:
+    # Relax consistency slightly: 0.50 lets net-zone bounces that straddle the side
+    # boundary pass, while still filtering out pure-noise detections.
+    if side_consistency < 0.50:
         keep_event = 0
     if event_likeness_score < 0.40:
         keep_event = 0
@@ -2948,6 +3051,15 @@ def run_bounce_detector(
 
     peak_indices = vote_peak_indices[:]
 
+    # Recover bounces the vote signal missed: add raw peaks that don't already have a
+    # nearby vote peak.  These are weaker signals that passed the lower 0.45 threshold
+    # but whose spatiotemporal cluster wasn't strong enough to exceed peak_min_score.
+    half_gap = peak_min_gap // 2
+    for raw_idx in raw_peak_indices:
+        if not any(abs(raw_idx - v) <= half_gap for v in peak_indices):
+            peak_indices.append(raw_idx)
+    peak_indices = sorted(set(peak_indices))
+
     if debug:
         print("[raw_peaks]", raw_peak_indices)
         print("[vote_base_peaks]", vote_peak_indices_base)
@@ -2973,6 +3085,7 @@ def run_bounce_detector(
             enable_side_arbitration=True,
             side_conflict_check_radius=1,
             side_look_radius=5,
+            net_y=net_y,
         )
         if evt is not None:
             raw_events.append(evt)

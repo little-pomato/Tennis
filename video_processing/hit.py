@@ -4,6 +4,7 @@ from typing import List, Optional
 
 import numpy as np
 import pandas as pd
+from scipy.signal import savgol_filter
 
 
 def _best_candidate_for_y_signal(cands: List[BlobCandidate]) -> Optional[BlobCandidate]:
@@ -80,12 +81,20 @@ def build_ball_y_signal_from_candidates(
         limit_direction="both"
     )
 
-    # 平滑 y，不要太大，避免 extrema 被拖太遠
-    df["y_smooth"] = (
-        df["y_filled"]
-        .rolling(window=smooth_win, center=True, min_periods=1)
-        .mean()
-    )
+    # Smooth y — Savitzky-Golay preserves local extrema (ball apex/bounce minimum)
+    # better than a rolling mean, which flattens and shifts peaks.
+    filled = df["y_filled"].values.copy()
+    n = len(filled)
+    win = smooth_win if smooth_win % 2 == 1 else smooth_win + 1
+    win = max(win, 3)
+    if n >= win:
+        df["y_smooth"] = savgol_filter(filled, window_length=win, polyorder=2, mode="nearest")
+    else:
+        df["y_smooth"] = (
+            df["y_filled"]
+            .rolling(window=smooth_win, center=True, min_periods=1)
+            .mean()
+        )
 
     return df
 

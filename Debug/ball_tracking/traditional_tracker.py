@@ -40,6 +40,7 @@ class Candidate:
     color_score: float
     score: float
     flow_mag: float = 0.0
+    continuity_bonus: float = 0.0
 
 
 @dataclass
@@ -91,6 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--diff-thresh", type=int, default=18, help="Threshold for near-field motion mask (bottom half).")
     parser.add_argument("--far-diff-thresh", type=int, default=10, help="Threshold for far-field motion mask (top half). Lower = more sensitive but more noise.")
+    parser.add_argument("--bg-thresh", type=int, default=15, help="Threshold for median background subtraction.")
     parser.add_argument("--min-area", type=float, default=2.0)
     parser.add_argument("--max-area", type=float, default=95.0)
     parser.add_argument("--max-wh", type=int, default=24)
@@ -398,7 +400,7 @@ def extract_candidates(
     gray_prev: np.ndarray,
     gray_curr: np.ndarray,
     gray_next: np.ndarray,
-    mog_mask: np.ndarray,
+    gray_bg: np.ndarray,
     valid_mask: np.ndarray,
     exclude_mask: np.ndarray,
     edge_mag: np.ndarray,
@@ -409,11 +411,11 @@ def extract_candidates(
     height, width = gray_curr.shape[:2]
     far_zone_h = int(height * 0.45)
     
+    # 1. Moving Objects (Frame Differencing)
     diff_prev = cv2.absdiff(gray_curr, gray_prev)
     diff_next = cv2.absdiff(gray_next, gray_curr)
     diff_mix = cv2.max(diff_prev, diff_next)
 
-    # Robust motion intersection: 
     # Use a softer approach than bitwise_and to catch small balls with 1-pixel overlap
     diff_min = cv2.min(diff_prev, diff_next)
     
@@ -433,19 +435,21 @@ def extract_candidates(
     diff_union = union_near.copy()
     diff_union[:far_zone_h, :] = union_far[:far_zone_h, :]
 
-    _, mog_bin = cv2.threshold(mog_mask, 180, 255, cv2.THRESH_BINARY)
-    if args.no_mog:
-        motion = diff_inter.copy()
-    else:
-        motion = cv2.bitwise_or(diff_inter, cv2.bitwise_and(diff_union, mog_bin))
+    # 2. True Foreground Objects (Background Subtraction with Brightness-Adaptive Threshold)
+    diff_bg = cv2.absdiff(gray_curr, gray_bg)
+    bright_scale = 0
+    bg_float = gray_bg.astype(np.float32)
+    thresh_map = args.bg_thresh * (1.0 + bg_float / 255.0 * bright_scale)
+    thresh_map[:far_zone_h, :] = max(5, args.bg_thresh - 5) * (1.0 + bg_float[:far_zone_h, :] / 255.0 * bright_scale)
+    bg_bin = (diff_bg.astype(np.float32) > thresh_map).astype(np.uint8) * 255
+
+    # 3. Intersection: Must be moving AND must be significantly different from the background
+    # This perfectly erases stationary noise, white lines, and background flicker
+    motion = cv2.bitwise_and(diff_inter, bg_bin)
         
-    # If the intersection is too weak, cautiously use union but prioritize mog
+    # If the intersection is too weak, cautiously use union, but strictly masked by true background difference
     if int(np.count_nonzero(motion)) < 10:
-        # Keep bits that appear in at least one difference AND are supported by MOG
-        motion = cv2.bitwise_or(motion, cv2.bitwise_and(diff_union, mog_bin))
-        # If still empty, use a very tight union
-        if int(np.count_nonzero(motion)) < 5:
-            motion = cv2.bitwise_or(motion, diff_inter)
+        motion = cv2.bitwise_and(diff_union, bg_bin)
 
     motion_fused = motion.copy()
     motion_roi = cv2.bitwise_and(motion_fused, valid_mask)
@@ -471,7 +475,7 @@ def extract_candidates(
         "diff_next": diff_next,
         "diff_union": diff_union,
         "diff_inter": diff_inter,
-        "mog": mog_bin,
+        "mog": bg_bin, # Keep key 'mog' for debug backward compatibility, but it's now 'bg_bin'
         "motion_fused": motion_fused,
         "after_roi": motion_roi,
         "after_exclusion": motion_excluded,
@@ -643,6 +647,10 @@ def associate_candidate(
             continue
             
         cost = dist - 18.0 * candidate.score
+
+        # Huge penalty for candidates that appear out of nowhere (no neighbour in prev frame)
+        if candidate.continuity_bonus < 0.5:
+            cost += 40.0  # Adjust this penalty weight as needed
             
         # Momentum consistency check (only applies if we already have some speed)
         if v_norm > 5.0:
@@ -699,6 +707,7 @@ def run_kalman_tracker(
     current_segment: List[TrackPoint] = []
     image_h, image_w = image_shape_hw
     margin = 40.0
+    consecutive_match_count = 0
     
     # Keep track of last valid position for association
     last_x, last_y = 0.0, 0.0
@@ -750,21 +759,25 @@ def run_kalman_tracker(
         )
 
         if candidate is not None:
-            corrected = kf.correct(np.array([[candidate.cx], [candidate.cy]], dtype=np.float32))
-            state = corrected
+            if candidate.continuity_bonus > 0.5 or lost_count > 0:  # allow correction if lost
+                corrected = kf.correct(np.array([[candidate.cx], [candidate.cy]], dtype=np.float32))
+                state = corrected
+                used = 1
+            else:
+                # First-appearance candidate: treat as unconfirmed, only predict
+                state = kf.statePost  # keep predicted state
+                used = 0  # mark as not used (will be interpolated later)
             lost_count = 0
             x = float(candidate.cx)
             y = float(candidate.cy)
             last_x, last_y = x, y
-            used = 1
-            interpolated = 0
-            score = float(candidate.score)
+            interpolated = 1 - used
+            score = float(candidate.score) if used else 0.0
         else:
             state = pred
             lost_count += 1
             x = pred_x
             y = pred_y
-            # Don't update last_x, last_y with prediction to avoid drift chain
             used = 0
             interpolated = 1 if lost_count <= 5 else 0
             score = 0.0
@@ -991,8 +1004,14 @@ def draw_debug_frame(
     track_point: Optional[TrackPoint],
     bounces: Sequence[BounceCandidate],
     motion_mask: Optional[np.ndarray],
+    valid_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     out = frame.copy()
+    
+    if valid_mask is not None:
+        contours, _ = cv2.findContours(valid_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(out, contours, -1, (0, 150, 0), 2)
+        
     for candidate in candidates[:20]:
         color = (0, int(120 + 135 * min(candidate.score, 1.0)), 255)
         cv2.rectangle(
@@ -1196,49 +1215,72 @@ def main() -> None:
         valid_mask = load_mask(args.mask, (height, width), args.scale, pad_x=args.roi_pad_x, pad_y=args.roi_pad_y)
     person_boxes = {} if args.no_player_exclusion else load_person_boxes(args.person_boxes_csv, args.scale)
     manual_exclude_rects = [] if args.no_manual_exclusion else parse_exclude_rects(args.exclude_rect or [], args.scale)
-    
+
     # Pre-compute the court lines exclusion mask
     court_lines_mask = load_court_lines_mask(args.roi_json, (height, width), args.scale, args.line_mask_thickness)
-    
+
     explicit_preprocess_frames = parse_frame_set(args.debug_preprocess_frames)
 
-    mog = cv2.createBackgroundSubtractorMOG2(history=80, varThreshold=18, detectShadows=False)
-    mog_masks = [mog.apply(frame, learningRate=0.02) for frame in frames]
+    print("Computing temporal median background...")
+    # Sample up to 100 frames to efficiently compute the median background
+    step = max(1, len(grays) // 100)
+    sampled_grays = np.array(grays[::step])
+    gray_bg = np.median(sampled_grays, axis=0).astype(np.uint8)
+    cv2.imwrite(str(debug_dir / "median_background.jpg"), gray_bg)
 
     heatmap = CandidateHeatmap((height, width))
     candidates_by_frame: Dict[int, List[Candidate]] = {}
     motion_by_frame: Dict[int, np.ndarray] = {}
     preprocess_stats: List[dict] = []
     frame_indices = [args.start + i for i in range(1, len(frames) - 1)]
+    
+    prev_candidates_centers: List[Tuple[float, float]] = []
 
     for local_idx in range(1, len(frames) - 1):
         global_idx = args.start + local_idx
         exclude_mask = exclusion_mask_for_boxes((height, width), person_boxes.get(global_idx, []))
         exclude_mask = add_rects_to_mask(exclude_mask, manual_exclude_rects)
-        
+
         # Add court lines to the exclusion mask
         exclude_mask = cv2.bitwise_or(exclude_mask, court_lines_mask)
-        
-        # Calculate Sobel edge magnitude for the current frame
 
+        # Calculate Sobel edge magnitude for the current frame
         gray_c = grays[local_idx]
         grad_x = cv2.Sobel(gray_c, cv2.CV_32F, 1, 0, ksize=3)
         grad_y = cv2.Sobel(gray_c, cv2.CV_32F, 0, 1, ksize=3)
         edge_mag = cv2.magnitude(grad_x, grad_y)
-        
+
         candidates, motion, stages = extract_candidates(
             global_idx,
             frames[local_idx],
             grays[local_idx - 1],
             grays[local_idx],
             grays[local_idx + 1],
-            mog_masks[local_idx],
+            gray_bg,
             valid_mask,
             exclude_mask,
             edge_mag,
             args,
             heatmap=heatmap,
         )
+
+        # After candidates are extracted for this frame
+        # Compute continuity flags for each candidate
+        if prev_candidates_centers:
+            for cand in candidates:
+                min_prev_dist = min(
+                    math.hypot(cand.cx - pcx, cand.cy - pcy) 
+                    for pcx, pcy in prev_candidates_centers
+                ) if prev_candidates_centers else float('inf')
+                cand.continuity_bonus = 1.0 if min_prev_dist < 20.0 else 0.0  # within 20 px
+        else:
+            for cand in candidates:
+                    cand.continuity_bonus = 0.0
+
+        # Update for next iteration
+        prev_candidates_centers = [(c.cx, c.cy) for c in candidates]
+
+
         heatmap.update(candidates)
         candidates_by_frame[global_idx] = candidates
         motion_by_frame[global_idx] = motion
@@ -1287,6 +1329,7 @@ def main() -> None:
             track_by_frame.get(global_idx),
             bounces,
             motion_by_frame.get(global_idx),
+            valid_mask if not args.no_roi_mask else None
         )
         if video_writer is not None:
             video_writer.write(debug)
@@ -1308,3 +1351,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+

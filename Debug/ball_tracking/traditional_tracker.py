@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import math
 import random
+import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -38,6 +39,7 @@ class Candidate:
     mean_motion: float
     color_score: float
     score: float
+    flow_mag: float = 0.0
 
 
 @dataclass
@@ -92,8 +94,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-area", type=float, default=2.0)
     parser.add_argument("--max-area", type=float, default=95.0)
     parser.add_argument("--max-wh", type=int, default=24)
-    parser.add_argument("--max-association-dist", type=float, default=55.0)
-    parser.add_argument("--roi-padding", type=int, default=60, help="Expand the ROI mask by this many pixels to catch high/wide balls.")
+    # Reduced max-association-dist to prevent the tracker from "teleporting" to distant noise
+    parser.add_argument("--max-association-dist", type=float, default=25.0)
+    parser.add_argument("--roi-pad-x", type=int, default=60, help="Expand the ROI mask horizontally by this many pixels.")
+    parser.add_argument("--roi-pad-y", type=int, default=40, help="Expand the ROI mask vertically by this many pixels.")
     parser.add_argument("--hm-bin-size", type=int, default=10, help="Heatmap bin size for static noise filtering.")
     parser.add_argument("--hm-threshold", type=float, default=0.35, help="Heatmap static noise threshold ratio (0.0 to 1.0).")
     parser.add_argument("--momentum-dir-penalty", type=float, default=60.0, help="Multiplier for directional change penalty.")
@@ -102,6 +106,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kalman-meas-noise", type=float, default=18.0, help="Kalman measurement noise (higher = trust physics more).")
     parser.add_argument("--min-track-measurements", type=int, default=4, help="Minimum real detections required to keep a track segment.")
     parser.add_argument("--min-track-displacement", type=float, default=15.0, help="Minimum pixel displacement for a valid track segment.")
+    parser.add_argument("--roi-json", type=Path, default=Path("dataset/v01/roi_config.json"), help="Path to roi_config.json to mask out painted court lines.")
+    parser.add_argument("--line-mask-thickness", type=int, default=5, help="Thickness of the line exclusion mask.")
     parser.add_argument("--debug-every", type=int, default=15)
     parser.add_argument(
         "--debug-preprocess",
@@ -156,7 +162,7 @@ def read_frame(path: Path, scale: float) -> np.ndarray:
     return frame
 
 
-def load_mask(mask_path: Path, shape_hw: Tuple[int, int], scale: float, padding: int = 0) -> np.ndarray:
+def load_mask(mask_path: Path, shape_hw: Tuple[int, int], scale: float, pad_x: int = 0, pad_y: int = 0) -> np.ndarray:
     h, w = shape_hw
     if not mask_path.exists():
         return np.full((h, w), 255, dtype=np.uint8)
@@ -171,11 +177,59 @@ def load_mask(mask_path: Path, shape_hw: Tuple[int, int], scale: float, padding:
         
     mask = ((mask > 0).astype(np.uint8) * 255)
     
-    if padding > 0:
-        # Create a circular structural element for smooth dilation
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (padding * 2 + 1, padding * 2 + 1))
+    if pad_x > 0 or pad_y > 0:
+        # Create an elliptical structural element for independent X/Y dilation
+        kernel_w = max(1, pad_x * 2 + 1)
+        kernel_h = max(1, pad_y * 2 + 1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_w, kernel_h))
         mask = cv2.dilate(mask, kernel)
         
+    return mask
+
+
+def load_court_lines_mask(roi_json_path: Path, shape_hw: Tuple[int, int], scale: float, thickness: int = 5) -> np.ndarray:
+    h, w = shape_hw
+    mask = np.zeros((h, w), dtype=np.uint8)
+    if not roi_json_path.exists():
+        return mask
+
+    try:
+        with open(roi_json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"Warning: Could not read {roi_json_path}: {e}")
+        return mask
+
+    # List of keys that contain line segments (list of [x, y] pairs)
+    line_keys = [
+        "FAR_BASELINE", "NEAR_BASELINE", "FAR_SERVICE_LINE", "NEAR_SERVICE_LINE",
+        "NET_BOTTOM_LINE", "NET_LINE", "NET_TOP_LINE", "MID_LINE", "SINGLES_LINES",
+        "DOUBLES_LINES"
+    ]
+
+    for key in line_keys:
+        val = data.get(key)
+        if val is None:
+            continue
+        
+        # Some keys might be a single line (list of 2 points), others might be multiple lines
+        # Let's normalize it to a list of lines
+        if isinstance(val, list) and len(val) > 0:
+            # If the first element is a coordinate pair (list of 2 numbers)
+            if isinstance(val[0], list) and len(val[0]) == 2 and isinstance(val[0][0], (int, float)):
+                lines = [val]
+            else:
+                lines = val
+                
+            for line_pts in lines:
+                if not isinstance(line_pts, list) or len(line_pts) < 2:
+                    continue
+                # Draw lines connecting the points
+                for i in range(len(line_pts) - 1):
+                    pt1 = (int(line_pts[i][0] * scale), int(line_pts[i][1] * scale))
+                    pt2 = (int(line_pts[i+1][0] * scale), int(line_pts[i+1][1] * scale))
+                    cv2.line(mask, pt1, pt2, 255, thickness)
+
     return mask
 
 
@@ -426,6 +480,7 @@ def extract_candidates(
 
     contours, _ = cv2.findContours(motion, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     candidates: List[Candidate] = []
+    pre_candidates: List[dict] = []
     image_h = frame.shape[0]
     for contour in contours:
         x, y, w, h = cv2.boundingRect(contour)
@@ -469,38 +524,64 @@ def extract_candidates(
         local_motion = float(np.mean(diff_mix[y : y + h, x : x + w]))
         color = tennis_color_score(frame, contour)
         edge_score = edge_density_score(edge_mag, int(x), int(y), int(w), int(h))
-        
-        # Scoring: Far balls have lower circularity and color cues
         y_ratio = float(y) / float(max(1, image_h - 1))
-        if y_ratio < 0.45:
-            # Prioritize motion, area consistency, and edge sharpness for far balls
-            area_score = max(0.0, 1.0 - abs(area - 4.0) / 20.0)
-            motion_score = float(np.clip(local_motion / 35.0, 0.0, 1.0))
-            score = 0.50 * motion_score + 0.20 * area_score + 0.20 * edge_score + 0.10 * circ_score
+        
+        pre_candidates.append({
+            "cx": cx, "cy": cy, "x": int(x), "y": int(y), "w": int(w), "h": int(h),
+            "area": area, "circ": circ, "circ_score": circ_score,
+            "local_motion": local_motion, "color": color, "edge_score": edge_score,
+            "y_ratio": y_ratio
+        })
+
+    if not pre_candidates:
+        return [], motion, debug_stages
+
+    # Calculate Lucas-Kanade Optical Flow for all candidate centers
+    pts_curr = np.array([[[c["cx"], c["cy"]]] for c in pre_candidates], dtype=np.float32)
+    lk_params = dict(winSize=(15, 15), maxLevel=2, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+    
+    pts_prev, status_bwd, _ = cv2.calcOpticalFlowPyrLK(gray_curr, gray_prev, pts_curr, None, **lk_params)
+    pts_next, status_fwd, _ = cv2.calcOpticalFlowPyrLK(gray_curr, gray_next, pts_curr, None, **lk_params)
+
+    for i, c in enumerate(pre_candidates):
+        flow_bwd = math.hypot(pts_prev[i][0][0] - c["cx"], pts_prev[i][0][1] - c["cy"]) if status_bwd is not None and status_bwd[i] else 0.0
+        flow_fwd = math.hypot(pts_next[i][0][0] - c["cx"], pts_next[i][0][1] - c["cy"]) if status_fwd is not None and status_fwd[i] else 0.0
+        flow_mag = max(flow_bwd, flow_fwd)
+        
+        # A real moving ball has significant flow. Static flicker has ~0 flow.
+        flow_score = float(np.clip((flow_mag - 1.0) / 10.0, 0.0, 1.0))
+        
+        if c["y_ratio"] < 0.45:
+            area_score = max(0.0, 1.0 - abs(c["area"] - 4.0) / 20.0)
+            motion_score = float(np.clip(c["local_motion"] / 35.0, 0.0, 1.0))
+            # Blending in flow_score to heavily reward real physical motion
+            score = 0.40 * motion_score + 0.15 * area_score + 0.15 * c["edge_score"] + 0.10 * c["circ_score"] + 0.20 * flow_score
         else:
-            area_score = max(0.0, 1.0 - abs(area - 10.0) / 50.0)
-            motion_score = float(np.clip(local_motion / 55.0, 0.0, 1.0))
-            score = 0.40 * motion_score + 0.20 * area_score + 0.20 * edge_score + 0.10 * circ_score + 0.10 * color
+            area_score = max(0.0, 1.0 - abs(c["area"] - 10.0) / 50.0)
+            motion_score = float(np.clip(c["local_motion"] / 55.0, 0.0, 1.0))
+            score = 0.35 * motion_score + 0.15 * area_score + 0.15 * c["edge_score"] + 0.10 * c["circ_score"] + 0.05 * c["color"] + 0.20 * flow_score
 
         candidates.append(
             Candidate(
                 frame_idx=frame_idx,
-                cx=cx,
-                cy=cy,
-                x=int(x),
-                y=int(y),
-                w=int(w),
-                h=int(h),
-                area=area,
-                circularity=circ,
-                mean_motion=local_motion,
-                color_score=color,
+                cx=c["cx"],
+                cy=c["cy"],
+                x=c["x"],
+                y=c["y"],
+                w=c["w"],
+                h=c["h"],
+                area=c["area"],
+                circularity=c["circ"],
+                mean_motion=c["local_motion"],
+                color_score=c["color"],
                 score=float(score),
+                flow_mag=float(flow_mag),
             )
         )
 
     candidates.sort(key=lambda c: c.score, reverse=True)
     return candidates, motion, debug_stages
+
 
 
 def create_kalman(dt: float = 1.0, proc_noise: float = 0.15, meas_noise: float = 18.0) -> cv2.KalmanFilter:
@@ -545,37 +626,54 @@ def associate_candidate(
     best_cost = float("inf")
     best_dist = float("inf")
     
-    # Expected displacement vector (momentum)
+    # Expected displacement vector (momentum from Kalman)
     evx = pred_x - prev_x
     evy = pred_y - prev_y
     v_norm = math.hypot(evx, evy)
     
+    # If the ball is moving fast, it cannot "turn on a dime" unless it bounces.
+    # Therefore, the search area should be an ellipse heavily biased forward along the velocity vector, 
+    # not a perfect circle (`max_dist`). We enforce this by heavily penalizing perpendicular distance.
+    
     for candidate in candidates[:40]:
         dist = math.hypot(candidate.cx - pred_x, candidate.cy - pred_y)
+        
+        # Absolute hard limit: A tennis ball rarely moves more than 40-50 pixels in 1/30th of a second
         if dist > max_dist:
             continue
             
-        # Momentum consistency check
-        if v_norm > 4.0:
+        cost = dist - 18.0 * candidate.score
+            
+        # Momentum consistency check (only applies if we already have some speed)
+        if v_norm > 5.0:
+            # 1. Trajectory Vector (Where did it move from last frame?)
             cvx = candidate.cx - prev_x
             cvy = candidate.cy - prev_y
             cv_norm = math.hypot(cvx, cvy)
             
-            # Directional dot product
+            # 2. Flow Vector (Where do the pixels *think* they are moving?)
+            # If LK flow contradicts the trajectory, it's likely a background object.
+            
+            # Directional dot product (Trajectory vs Kalman Prediction)
             dot = (cvx * evx + cvy * evy) / (v_norm * cv_norm + 1e-6)
             
             dir_penalty = 0.0
-            if dot < 0.5:
-                # Strong penalty for turning more than ~60 degrees
-                dir_penalty = dir_penalty_mult * (0.5 - dot)
+            if dot < 0.6:
+                # Extremely strict penalty for turning more than ~50 degrees
+                # This prevents "snapping" to a noise point next to the ball
+                dir_penalty = dir_penalty_mult * (0.6 - dot) * 2.0
             
             # Velocity magnitude penalty: prevent sudden speed jumps or stops
             v_ratio = cv_norm / v_norm
             v_penalty = vel_penalty_mult * abs(math.log(v_ratio + 1e-6))
             
-            cost = dist + dir_penalty + v_penalty - 18.0 * candidate.score
-        else:
-            cost = dist - 18.0 * candidate.score
+            # If the candidate has NO optical flow (flow_mag < 1.0) but we expect it to move fast,
+            # it is almost certainly a flickering noise dot (like a star or reflection).
+            flow_penalty = 0.0
+            if candidate.flow_mag < 1.5 and cv_norm > 8.0:
+                flow_penalty = 50.0 # Massive penalty for teleporting to a stationary object
+                
+            cost += dir_penalty + v_penalty + flow_penalty
             
         if cost < best_cost:
             best = candidate
@@ -1095,9 +1193,13 @@ def main() -> None:
     if args.no_roi_mask:
         valid_mask = np.full((height, width), 255, dtype=np.uint8)
     else:
-        valid_mask = load_mask(args.mask, (height, width), args.scale, padding=args.roi_padding)
+        valid_mask = load_mask(args.mask, (height, width), args.scale, pad_x=args.roi_pad_x, pad_y=args.roi_pad_y)
     person_boxes = {} if args.no_player_exclusion else load_person_boxes(args.person_boxes_csv, args.scale)
     manual_exclude_rects = [] if args.no_manual_exclusion else parse_exclude_rects(args.exclude_rect or [], args.scale)
+    
+    # Pre-compute the court lines exclusion mask
+    court_lines_mask = load_court_lines_mask(args.roi_json, (height, width), args.scale, args.line_mask_thickness)
+    
     explicit_preprocess_frames = parse_frame_set(args.debug_preprocess_frames)
 
     mog = cv2.createBackgroundSubtractorMOG2(history=80, varThreshold=18, detectShadows=False)
@@ -1113,6 +1215,17 @@ def main() -> None:
         global_idx = args.start + local_idx
         exclude_mask = exclusion_mask_for_boxes((height, width), person_boxes.get(global_idx, []))
         exclude_mask = add_rects_to_mask(exclude_mask, manual_exclude_rects)
+        
+        # Add court lines to the exclusion mask
+        exclude_mask = cv2.bitwise_or(exclude_mask, court_lines_mask)
+        
+        # Calculate Sobel edge magnitude for the current frame
+
+        gray_c = grays[local_idx]
+        grad_x = cv2.Sobel(gray_c, cv2.CV_32F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(gray_c, cv2.CV_32F, 0, 1, ksize=3)
+        edge_mag = cv2.magnitude(grad_x, grad_y)
+        
         candidates, motion, stages = extract_candidates(
             global_idx,
             frames[local_idx],
@@ -1122,6 +1235,7 @@ def main() -> None:
             mog_masks[local_idx],
             valid_mask,
             exclude_mask,
+            edge_mag,
             args,
             heatmap=heatmap,
         )

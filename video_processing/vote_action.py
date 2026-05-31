@@ -888,10 +888,15 @@ def run_vote(args: argparse.Namespace) -> None:
     events_df = filter_events_by_side(events_df, args.target_side)
     after_filter = len(events_df)
     if after_filter == 0:
-        raise ValueError(
-            f"No events left after --target-side {args.target_side}. "
-            f"Original events: {before_filter}. Check event_side / hit_side in {event_file}."
-        )
+        print(f"[WARNING] No events left after --target-side {args.target_side}. "
+              f"Original events: {before_filter}. Skipping stroke voting.")
+        
+        # Create empty output files to keep downstream tools happy
+        out_dir = Path(args.out_dir) if args.out_dir else paths["stroke_out_dir"]
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "stroke_vote_frame_predictions.csv").touch()
+        (out_dir / "stroke_vote_events.csv").touch()
+        return
 
     out_dir = Path(args.out_dir) if args.out_dir else paths["stroke_out_dir"]
     out_dir.mkdir(parents=True, exist_ok=True)

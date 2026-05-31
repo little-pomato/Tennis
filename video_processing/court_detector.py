@@ -248,7 +248,7 @@ def preprocess(img_bgr, ignore_mask=None):
 
     gray = cv2.cvtColor(eq, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blur, 50, 150)
+    edges = cv2.Canny(blur, 40, 120)
 
     roi = np.zeros((h, w), dtype=np.uint8)
     pts = np.array([
@@ -265,7 +265,7 @@ def preprocess(img_bgr, ignore_mask=None):
     edges_roi = cv2.bitwise_and(edges, roi)
 
     hsv = cv2.cvtColor(eq, cv2.COLOR_BGR2HSV)
-    white = cv2.inRange(hsv, (0, 0, 145), (180, 110, 255))
+    white = cv2.inRange(hsv, (0, 0, 125), (180, 110, 255))
     white = cv2.bitwise_and(white, roi)
 
     return eq, gray, blur, edges, roi, edges_roi, white
@@ -280,9 +280,9 @@ def detect_segments(edges_roi, img_shape):
         edges_roi,
         rho=1,
         theta=np.pi / 180,
-        threshold=35,
-        minLineLength=max(25, int(0.04 * w)),
-        maxLineGap=max(12, int(0.02 * w)),
+        threshold=30,
+        minLineLength=max(20, int(0.035 * w)),
+        maxLineGap=max(15, int(0.025 * w)),
     )
 
     if lines is None:
@@ -2176,7 +2176,7 @@ def validate_roi_config(cfg, img_shape):
 
     if not (far_y < far_service_y < net_y < near_service_y < near_y):
         return False, "court_y_order_invalid"
-    if far_y > 0.40 * h:
+    if far_y > 0.45 * h:
         return False, "far_baseline_too_low"
     if far_service_y - far_y < 0.04 * h:
         return False, "far_service_too_close_to_far_baseline"

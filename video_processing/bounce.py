@@ -936,22 +936,40 @@ def score_bounce_events(
                 )
             cand.score_event = max(0.0, cand.score_event)
 
-            # Direction-of-motion sanity check:
-            # A real bounce must show the ball falling TOWARD the court before impact
-            # and rising AWAY after.  In image coords (y↓):
-            #   near side: ball falls → prev_dy > 0 then rises → next_dy < 0
-            #   far  side: ball falls → prev_dy < 0 then rises → next_dy > 0
-            # A serve toss apex is exactly the reverse — penalise it heavily.
-            # Only apply when both neighbors are found and steps are non-trivial
-            # (avoids noisy direction on nearly-stationary blobs).
+            # Curvature and Directionality filtering:
+            # A real bounce must show a sharp change in direction (V-shape).
+            # An apex of a high trajectory (inverted V-shape) can cause a "speed dip" 
+            # and high score, especially in the far court where resolution is low.
+            # 
+            # In image coords (y↓):
+            # Near side bounce: ball falls (dy>0) then rises (dy<0). Apex is (dy<0 -> dy>0).
+            # Far side bounce:  ball falls (dy<0) then rises (dy>0). Apex is (dy>0 -> dy<0).
             if (prev_c is not None and next_c is not None
-                    and cand.prev_step > 3.0 and cand.next_step > 3.0):
+                    and cand.prev_step > 2.5 and cand.next_step > 2.5):
+                
+                # Check for "Inverted V" (Apex) pattern which is often a false bounce
+                is_apex = False
                 if cand.court_side == "near":
-                    serve_toss_pattern = (cand.prev_dy < 0 and cand.next_dy > 0)
+                    # Near side apex: ball was moving UP (dy < 0) and now moves DOWN (dy > 0)
+                    is_apex = (cand.prev_dy < -1.0 and cand.next_dy > 1.0)
                 else:
-                    serve_toss_pattern = (cand.prev_dy > 0 and cand.next_dy < 0)
-                if serve_toss_pattern:
-                    cand.score_event *= 0.35
+                    # Far side apex: ball was moving DOWN (dy > 0) and now moves UP (dy < 0)
+                    # This is the most common false positive for high lobs in the far court.
+                    is_apex = (cand.prev_dy > 0.8 and cand.next_dy < -0.8)
+                
+                if is_apex:
+                    # Heavily penalize the apex of a curve to avoid false bounce detection
+                    cand.score_event *= 0.30
+                
+                # Bonus for "Sharp V" (Real Bounce) pattern
+                is_sharp_v = False
+                if cand.court_side == "near":
+                    is_sharp_v = (cand.prev_dy > 1.5 and cand.next_dy < -1.5)
+                else:
+                    is_sharp_v = (cand.prev_dy < -1.0 and cand.next_dy > 1.0)
+                
+                if is_sharp_v:
+                    cand.score_event *= 1.15
 
             if cand.is_interpolated == 1:
                 cand.score_event *= 0.72

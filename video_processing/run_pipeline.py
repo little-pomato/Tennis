@@ -71,6 +71,13 @@ def main() -> None:
         default=str(DEFAULT_STROKE_CHECKPOINT),
         help="stroke classifier checkpoint；預設 project/dataset/tennis_actions/outputs/croped/best_model.pt",
     )
+    parser.add_argument(
+        "--target-side",
+        type=str,
+        default="near",
+        choices=["near", "far", "all"],
+        help="只對哪一側的擊球 event 做正反拍投票；預設 near。",
+    )
     parser.add_argument("--skip-vote", action="store_true", help="跳過正反拍投票 vote_action.py")
     parser.add_argument("--skip-analysis", action="store_true", help="跳過 analysis_per.py")
     parser.add_argument("--skip-visualization", action="store_true", help="跳過 visualization.py")
@@ -111,6 +118,7 @@ def main() -> None:
             [
                 "--checkpoint", checkpoint,
                 "--yolo-cache-dir", bounce_dir,
+                "--target-side", args.target_side,
             ],
         )
 

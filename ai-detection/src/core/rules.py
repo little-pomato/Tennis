@@ -124,19 +124,21 @@ class InoutRuleEngine(BaseDetector):
         
         x, y = pos_2d
         
+        # Tolerance for ball radius and homography noise (5cm)
+        tol = 0.05
+        
         # Check Long (y-axis)
-        if y < self.config.y_min:
-            return "Out - Long (Far)"
-        if y > self.config.y_max:
-            return "Out - Long (Near)"
+        if y < self.config.y_min - tol:
+            return "Out - Long"
+        if y > self.config.y_max + tol:
+            return "Out - Long"
             
         # Check Wide (x-axis)
-        # Assuming doubles lines are the outer boundary
-        if x < self.config.x_min or x > self.config.x_max:
+        # Default to singles lines as it's the most common failure point in reports
+        if x < self.config.singles_x_min - tol or x > self.config.singles_x_max + tol:
+            # Check if it's at least within doubles lines for clarity
+            if self.config.x_min - tol <= x <= self.config.x_max + tol:
+                return "Out - Wide (Doubles Alley)"
             return "Out - Wide"
-            
-        # Optional: Check if it's within singles lines
-        if x < self.config.singles_x_min or x > self.config.singles_x_max:
-            return "In (Doubles Alley)"
             
         return "In"

@@ -54,7 +54,7 @@ def read_video_to_disk(path: str, temp_dir: str = "temp_frames", max_long_side: 
         source_idx += 1
         
     cap.release()
-    return frame_paths, int(actual_fps), final_w, final_h
+    return frame_paths, actual_fps, final_w, final_h
 
 def scene_detect(path_video: str) -> List[List[int]]:
     """Split video into disjoint fragments."""

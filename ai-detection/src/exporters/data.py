@@ -21,6 +21,7 @@ class DataExporter:
                 ],
                 "bounces": context.bounce_analysis,
                 "players": context.players,
+                "analytics": context.analytics_data,
                 # Convert matrices to lists for JSON serialization
                 "homography_matrices": [
                     m.tolist() if m is not None else None 

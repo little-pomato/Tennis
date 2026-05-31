@@ -77,6 +77,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Debug classical tennis ball tracking and bounce detection."
     )
+    parser.add_argument("--tracknet-model", type=Path, default=None, help="Path to TrackNet model to use for candidate generation")
+    parser.add_argument("--tracknet-only", action="store_true", help="Skip all classical CV preprocessing and ONLY use TrackNet")
     parser.add_argument("--frames-dir", type=Path, default=Path("dataset/v01/frames"))
     parser.add_argument("--mask", type=Path, default=Path("dataset/v01/valid_mask.png"))
     parser.add_argument(
@@ -1005,48 +1007,66 @@ def draw_debug_frame(
     bounces: Sequence[BounceCandidate],
     motion_mask: Optional[np.ndarray],
     valid_mask: Optional[np.ndarray] = None,
+    trajectory: Optional[List[Tuple[int, int]]] = None,
 ) -> np.ndarray:
     out = frame.copy()
     
+    # Optional valid mask drawing
     if valid_mask is not None:
         contours, _ = cv2.findContours(valid_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(out, contours, -1, (0, 150, 0), 2)
         
-    for candidate in candidates[:20]:
-        color = (0, int(120 + 135 * min(candidate.score, 1.0)), 255)
-        cv2.rectangle(
-            out,
-            (candidate.x, candidate.y),
-            (candidate.x + candidate.w, candidate.y + candidate.h),
-            color,
-            1,
-        )
-        cv2.circle(out, (int(round(candidate.cx)), int(round(candidate.cy))), 2, color, -1)
+    # Draw fading trajectory tail if provided
+    if trajectory:
+        for i in range(1, len(trajectory)):
+            pt1 = trajectory[i - 1]
+            pt2 = trajectory[i]
+            # Fade the color based on age (older is more transparent/darker)
+            intensity = int(255 * (i / len(trajectory)))
+            color = (0, intensity, 255) # Orange-ish yellow fading trail
+            cv2.line(out, pt1, pt2, color, max(1, int(3 * (i / len(trajectory)))), cv2.LINE_AA)
 
+    # Draw candidates lightly
+    for candidate in candidates[:5]: # only top 5 to reduce clutter
+        # Light orange circle for candidates
+        color = (0, 165, 255)
+        # alpha blending for candidate dots
+        overlay = out.copy()
+        cv2.circle(overlay, (int(round(candidate.cx)), int(round(candidate.cy))), 3, color, -1)
+        out = cv2.addWeighted(overlay, 0.4, out, 0.6, 0)
+
+    # Draw main tracked point
     if track_point is not None:
-        cv2.circle(out, (int(round(track_point.pred_x)), int(round(track_point.pred_y))), 6, (255, 0, 0), 1)
-        cv2.circle(out, (int(round(track_point.x)), int(round(track_point.y))), 5, (0, 255, 0), -1)
+        x, y = int(round(track_point.x)), int(round(track_point.y))
+        px, py = int(round(track_point.pred_x)), int(round(track_point.pred_y))
+        
+        # Outer glow/ring
+        cv2.circle(out, (x, y), 8, (0, 255, 255), 2, cv2.LINE_AA)
+        # Inner solid ball
+        cv2.circle(out, (x, y), 4, (0, 255, 255), -1, cv2.LINE_AA)
+        
+        # Draw small prediction dot if it differs significantly
+        if math.hypot(x - px, y - py) > 3.0:
+            cv2.circle(out, (px, py), 2, (255, 0, 0), -1, cv2.LINE_AA)
 
     for bounce in bounces:
-        if abs(bounce.frame_idx - frame_idx) <= 2:
-            cv2.drawMarker(
-                out,
-                (int(round(bounce.x)), int(round(bounce.y))),
-                (0, 0, 255),
-                markerType=cv2.MARKER_CROSS,
-                markerSize=18,
-                thickness=2,
-            )
-            cv2.putText(
-                out,
-                f"bounce {bounce.score:.2f}",
-                (int(round(bounce.x)) + 8, int(round(bounce.y)) - 8),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                (0, 0, 255),
-                1,
-                cv2.LINE_AA,
-            )
+        if abs(bounce.frame_idx - frame_idx) <= 5:
+            # Draw an expanding ripple effect for bounces
+            age = abs(bounce.frame_idx - frame_idx)
+            radius = 10 + age * 5
+            color = (0, 0, 255)
+            cv2.circle(out, (int(round(bounce.x)), int(round(bounce.y))), radius, color, 2, cv2.LINE_AA)
+            if age == 0:
+                 cv2.putText(
+                    out,
+                    "BOUNCE",
+                    (int(round(bounce.x)) + 15, int(round(bounce.y)) - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 0, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
 
     cv2.putText(out, f"frame {frame_idx}", (12, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     cv2.putText(out, f"frame {frame_idx}", (12, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (30, 30, 30), 1)
@@ -1192,6 +1212,21 @@ def write_csv(path: Path, rows: Iterable[dict]) -> None:
 
 def main() -> None:
     args = parse_args()
+    
+    tracknet = None
+    device = 'cpu'
+    if args.tracknet_model:
+        import sys
+        sys.path.append(str(Path("Debug/ball_tracking/TrackNet").resolve()))
+        import torch
+        from model import BallTrackerNet
+        device = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
+        tracknet = BallTrackerNet()
+        tracknet.load_state_dict(torch.load(str(args.tracknet_model), map_location=device))
+        tracknet.to(device)
+        tracknet.eval()
+        print(f"Loaded TrackNet model from {args.tracknet_model} on {device}")
+
     output_dir = args.output_dir
     debug_dir = output_dir / "debug_frames"
     preprocess_debug_dir = output_dir / "preprocess_debug"
@@ -1207,8 +1242,12 @@ def main() -> None:
         raise ValueError("Need at least 3 frames for adjacent-frame differencing.")
 
     frames = [read_frame(p, args.scale) for p in frame_paths]
-    grays = [preprocess_gray(f, use_clahe=not args.no_clahe) for f in frames]
-    height, width = grays[0].shape[:2]
+    height, width = frames[0].shape[:2]
+    
+    if not args.tracknet_only:
+        grays = [preprocess_gray(f, use_clahe=not args.no_clahe) for f in frames]
+    else:
+        grays = []
     if args.no_roi_mask:
         valid_mask = np.full((height, width), 255, dtype=np.uint8)
     else:
@@ -1221,12 +1260,15 @@ def main() -> None:
 
     explicit_preprocess_frames = parse_frame_set(args.debug_preprocess_frames)
 
-    print("Computing temporal median background...")
-    # Sample up to 100 frames to efficiently compute the median background
-    step = max(1, len(grays) // 100)
-    sampled_grays = np.array(grays[::step])
-    gray_bg = np.median(sampled_grays, axis=0).astype(np.uint8)
-    cv2.imwrite(str(debug_dir / "median_background.jpg"), gray_bg)
+    if not args.tracknet_only:
+        print("Computing temporal median background...")
+        # Sample up to 100 frames to efficiently compute the median background
+        step = max(1, len(grays) // 100)
+        sampled_grays = np.array(grays[::step])
+        gray_bg = np.median(sampled_grays, axis=0).astype(np.uint8)
+        cv2.imwrite(str(debug_dir / "median_background.jpg"), gray_bg)
+    else:
+        gray_bg = None
 
     heatmap = CandidateHeatmap((height, width))
     candidates_by_frame: Dict[int, List[Candidate]] = {}
@@ -1238,31 +1280,68 @@ def main() -> None:
 
     for local_idx in range(1, len(frames) - 1):
         global_idx = args.start + local_idx
-        exclude_mask = exclusion_mask_for_boxes((height, width), person_boxes.get(global_idx, []))
-        exclude_mask = add_rects_to_mask(exclude_mask, manual_exclude_rects)
+        if not args.tracknet_only:
+            exclude_mask = exclusion_mask_for_boxes((height, width), person_boxes.get(global_idx, []))
+            exclude_mask = add_rects_to_mask(exclude_mask, manual_exclude_rects)
 
-        # Add court lines to the exclusion mask
-        exclude_mask = cv2.bitwise_or(exclude_mask, court_lines_mask)
+            # Add court lines to the exclusion mask
+            exclude_mask = cv2.bitwise_or(exclude_mask, court_lines_mask)
 
-        # Calculate Sobel edge magnitude for the current frame
-        gray_c = grays[local_idx]
-        grad_x = cv2.Sobel(gray_c, cv2.CV_32F, 1, 0, ksize=3)
-        grad_y = cv2.Sobel(gray_c, cv2.CV_32F, 0, 1, ksize=3)
-        edge_mag = cv2.magnitude(grad_x, grad_y)
+            # Calculate Sobel edge magnitude for the current frame
+            gray_c = grays[local_idx]
+            grad_x = cv2.Sobel(gray_c, cv2.CV_32F, 1, 0, ksize=3)
+            grad_y = cv2.Sobel(gray_c, cv2.CV_32F, 0, 1, ksize=3)
+            edge_mag = cv2.magnitude(grad_x, grad_y)
 
-        candidates, motion, stages = extract_candidates(
-            global_idx,
-            frames[local_idx],
-            grays[local_idx - 1],
-            grays[local_idx],
-            grays[local_idx + 1],
-            gray_bg,
-            valid_mask,
-            exclude_mask,
-            edge_mag,
-            args,
-            heatmap=heatmap,
-        )
+            candidates, motion, stages = extract_candidates(
+                global_idx,
+                frames[local_idx],
+                grays[local_idx - 1],
+                grays[local_idx],
+                grays[local_idx + 1],
+                gray_bg,
+                valid_mask,
+                exclude_mask,
+                edge_mag,
+                args,
+                heatmap=heatmap,
+            )
+        else:
+            candidates = []
+            motion = np.zeros((height, width), dtype=np.uint8)
+            stages = {}
+
+        if tracknet is not None and local_idx >= 2:
+            import torch
+            # TrackNet expects sequence: current, previous, pre-previous
+            img = cv2.resize(frames[local_idx], (640, 360))
+            img_prev = cv2.resize(frames[local_idx - 1], (640, 360))
+            img_preprev = cv2.resize(frames[local_idx - 2], (640, 360))
+            imgs = np.concatenate((img, img_prev, img_preprev), axis=2)
+            imgs = imgs.astype(np.float32) / 255.0
+            imgs = np.rollaxis(imgs, 2, 0)
+            inp = np.expand_dims(imgs, axis=0)
+
+            with torch.no_grad():
+                out = tracknet(torch.from_numpy(inp).float().to(device))
+                output = out.argmax(dim=1).detach().cpu().numpy()[0]
+
+            feature_map = output * 255
+            feature_map = feature_map.reshape((360, 640)).astype(np.uint8)
+            ret, t_heatmap = cv2.threshold(feature_map, 127, 255, cv2.THRESH_BINARY)
+            circles = cv2.HoughCircles(t_heatmap, cv2.HOUGH_GRADIENT, dp=1, minDist=1, param1=50, param2=2, minRadius=2, maxRadius=7)
+
+            if circles is not None and len(circles) == 1:
+                tx = circles[0][0][0] * (width / 640.0)
+                ty = circles[0][0][1] * (height / 360.0)
+                
+                # Append high-score candidate from TrackNet
+                candidates.insert(0, Candidate(
+                    frame_idx=global_idx,
+                    cx=tx, cy=ty, x=int(tx), y=int(ty), w=5, h=5,
+                    area=25.0, circularity=1.0, mean_motion=100.0,
+                    color_score=1.0, score=5.0, flow_mag=10.0, continuity_bonus=1.0
+                ))
 
         # After candidates are extracted for this frame
         # Compute continuity flags for each candidate
@@ -1320,16 +1399,27 @@ def main() -> None:
             (width, height),
         )
 
+    trajectory_history = []
+    
     for local_idx, frame in enumerate(frames):
         global_idx = args.start + local_idx
+        
+        current_track_point = track_by_frame.get(global_idx)
+        if current_track_point is not None:
+            trajectory_history.append((int(round(current_track_point.x)), int(round(current_track_point.y))))
+            # Keep only the last 15 points for the tail
+            if len(trajectory_history) > 15:
+                trajectory_history.pop(0)
+        
         debug = draw_debug_frame(
             frame,
             global_idx,
             candidates_by_frame.get(global_idx, []),
-            track_by_frame.get(global_idx),
+            current_track_point,
             bounces,
             motion_by_frame.get(global_idx),
-            valid_mask if not args.no_roi_mask else None
+            valid_mask if not args.no_roi_mask else None,
+            trajectory=trajectory_history
         )
         if video_writer is not None:
             video_writer.write(debug)

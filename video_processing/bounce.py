@@ -2781,6 +2781,8 @@ def draw_hit_interval_y_debug(
     
 def run_bounce_detector(
     video_path: Path,
+    tracknet_model: Optional[str] = None,
+    tracknet_only: bool = False,
     scale: float = 1.0,
     diff_th: int = 10,
     min_area: int = 2,
@@ -2866,14 +2868,32 @@ def run_bounce_detector(
         h, w = grays[0].shape
         net_line = [[0, h//2], [w, h//2]]
     tracker = TwoPlayerTracker(NET_LINE=net_line)
+    
+    tracknet = None
+    device_tn = 'cpu'
+    if tracknet_model:
+        import sys
+        sys.path.append(str(Path(__file__).resolve().parent.parent / "Debug" / "ball_tracking" / "TrackNet"))
+        import torch
+        from model import BallTrackerNet
+        device_tn = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
+        tracknet = BallTrackerNet()
+        tracknet.load_state_dict(torch.load(str(tracknet_model), map_location=device_tn))
+        tracknet.to(device_tn)
+        tracknet.eval()
+        print(f"[INFO] Loaded TrackNet model from {tracknet_model} on {device_tn}")
 
     for i in range(1, n - 1):
-        diff_prev, diff_next, fg_union, fg_inter = build_motion_triplet(
-            grays[i - 1], grays[i], grays[i + 1],
-            search_mask_static,
-            diff_th=diff_th,
-            blur_ksize=3,
-        )
+        if not tracknet_only:
+            diff_prev, diff_next, fg_union, fg_inter = build_motion_triplet(
+                grays[i - 1], grays[i], grays[i + 1],
+                search_mask_static,
+                diff_th=diff_th,
+                blur_ksize=3,
+            )
+        else:
+            diff_prev = diff_next = fg_union = fg_inter = np.zeros_like(search_mask_static)
+
         if (i == 1) or (yolo_every_n <= 1) or (i % yolo_every_n == 0):
             # Important: run YOLO on the ORIGINAL frame.
             # vote_action uses original-frame geometry for crop; bounce masks may use scaled coordinates.
@@ -2929,9 +2949,6 @@ def run_bounce_detector(
             
         # ------------------------------------------------------------
         # Save tracked player boxes for later pose / stroke classification
-        # 注意：
-        # - 如果 scale=1.0，x1/y1/x2/y2 就是原始 frame 座標
-        # - 如果 scale != 1.0，這裡同時存 scaled 座標與 original 座標
         # ------------------------------------------------------------
         for player_name, box in cached_tracked_players:
             x1, y1, x2, y2, conf = box
@@ -2952,8 +2969,6 @@ def run_bounce_detector(
             tracked_player_rows.append({
                 "frame_idx": int(i),
                 "player": str(player_name),
-
-                # 座標是 bounce.py 當下使用的座標；scale=1 時就是原圖座標
                 "x1": float(x1),
                 "y1": float(y1),
                 "x2": float(x2),
@@ -2963,42 +2978,82 @@ def run_bounce_detector(
                 "cy": cy_box,
                 "w": w_box,
                 "h": h_box,
-
-                # 保險起見，也存原始 frame 座標
                 "x1_orig": x1_orig,
                 "y1_orig": y1_orig,
                 "x2_orig": x2_orig,
                 "y2_orig": y2_orig,
-
                 "scale": float(scale),
             })
 
         search_mask_dyn = cv2.bitwise_and(search_mask_static, cv2.bitwise_not(core_mask))
-        fg_union = cv2.bitwise_and(fg_union, search_mask_dyn)
-        fg_inter = cv2.bitwise_and(fg_inter, search_mask_dyn)
         
-        human_dist_map = None
-        if np.count_nonzero(soft_mask) > 0:
-            inv_soft = cv2.bitwise_not(soft_mask)
-            human_dist_map = cv2.distanceTransform(inv_soft, cv2.DIST_L2, 3).astype(np.float32)
+        if not tracknet_only:
+            fg_union = cv2.bitwise_and(fg_union, search_mask_dyn)
+            fg_inter = cv2.bitwise_and(fg_inter, search_mask_dyn)
+            
+            human_dist_map = None
+            if np.count_nonzero(soft_mask) > 0:
+                inv_soft = cv2.bitwise_not(soft_mask)
+                human_dist_map = cv2.distanceTransform(inv_soft, cv2.DIST_L2, 3).astype(np.float32)
 
-        frame_cands = extract_blob_candidates(
-            frame_idx=i,
-            fg_union=fg_union,
-            fg_inter=fg_inter,
-            diff_prev=diff_prev,
-            diff_next=diff_next,
-            min_area=min_area,
-            max_area=max_area,
-            max_wh=max_wh,
-            inter_weight=0.25,
-            net_dist_map=net_dist_map,
-            net_penalty_radius=net_penalty_radius,
-            net_penalty_weight=net_penalty_weight,
-            human_dist_map=human_dist_map,
-            human_penalty_radius=35.0,   # extended from 18 → 35 px; gradual fade zone
-            human_penalty_weight=0.45,   # stronger suppression near player body
-        )
+            frame_cands = extract_blob_candidates(
+                frame_idx=i,
+                fg_union=fg_union,
+                fg_inter=fg_inter,
+                diff_prev=diff_prev,
+                diff_next=diff_next,
+                min_area=min_area,
+                max_area=max_area,
+                max_wh=max_wh,
+                inter_weight=0.25,
+                net_dist_map=net_dist_map,
+                net_penalty_radius=net_penalty_radius,
+                net_penalty_weight=net_penalty_weight,
+                human_dist_map=human_dist_map,
+                human_penalty_radius=35.0,
+                human_penalty_weight=0.45,
+            )
+        else:
+            frame_cands = []
+            if tracknet is not None:
+                import torch
+                # Load BGR frames exactly as expected by TrackNet
+                # Notice we use cv2.imread for i, i-1, i-2 but we only really have frame_paths
+                img = cv2.imread(str(frame_paths[i]))
+                img_prev = cv2.imread(str(frame_paths[i - 1]))
+                img_preprev = cv2.imread(str(frame_paths[i - 2])) if i >= 2 else img_prev
+                
+                img_resized = cv2.resize(img, (640, 360))
+                img_prev_resized = cv2.resize(img_prev, (640, 360))
+                img_preprev_resized = cv2.resize(img_preprev, (640, 360))
+                
+                imgs = np.concatenate((img_resized, img_prev_resized, img_preprev_resized), axis=2)
+                imgs = imgs.astype(np.float32) / 255.0
+                imgs = np.rollaxis(imgs, 2, 0)
+                inp = np.expand_dims(imgs, axis=0)
+
+                with torch.no_grad():
+                    out = tracknet(torch.from_numpy(inp).float().to(device_tn))
+                    output = out.argmax(dim=1).detach().cpu().numpy()[0]
+
+                feature_map = output * 255
+                feature_map = feature_map.reshape((360, 640)).astype(np.uint8)
+                ret, t_heatmap = cv2.threshold(feature_map, 127, 255, cv2.THRESH_BINARY)
+                circles = cv2.HoughCircles(t_heatmap, cv2.HOUGH_GRADIENT, dp=1, minDist=1, param1=50, param2=2, minRadius=2, maxRadius=7)
+
+                if circles is not None and len(circles) == 1:
+                    # Convert 640x360 coordinates to the target coordinate space (which is original * scale)
+                    orig_h, orig_w = img.shape[:2]
+                    tx = circles[0][0][0] * (orig_w / 640.0) * scale
+                    ty = circles[0][0][1] * (orig_h / 360.0) * scale
+                    
+                    frame_cands.append(BlobCandidate(
+                        frame_idx=i, cx=tx, cy=ty, x=int(tx), y=int(ty), w=5, h=5,
+                        area=25.0, circ=1.0, mean_diff=100.0,
+                        score_blob=1.0, dist_to_net=0.0, net_penalty=0.0,
+                        dist_to_human=0.0, human_penalty=0.0
+                    ))
+
         candidates_by_frame[i] = frame_cands
 
         frame_rows.append({
@@ -3380,6 +3435,8 @@ def run_bounce_detector(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("video_path", type=str, help="例如 raw_videos/xxx.mp4")
+    parser.add_argument("--tracknet-model", type=str, default=None, help="Path to TrackNet model")
+    parser.add_argument("--tracknet-only", action="store_true", help="Use TrackNet and skip classical extraction")
     parser.add_argument("--scale", type=float, default=1.0)
     parser.add_argument("--diff-th", type=int, default=10)
     parser.add_argument("--min-area", type=int, default=2)
@@ -3406,6 +3463,8 @@ if __name__ == "__main__":
 
     run_bounce_detector(
         video_path=Path(args.video_path),
+        tracknet_model=args.tracknet_model,
+        tracknet_only=args.tracknet_only,
         scale=args.scale,
         diff_th=args.diff_th,
         min_area=args.min_area,

@@ -586,6 +586,17 @@ def make_debug_video_overlay(
     # Build lookup: frame_idx -> list of dicts with pixel coords + projected court coords
     pixel_by_frame: Dict[int, List[dict]] = {}
     bounce_by_idx = {int(r["frame_idx"]): r for _, r in bounce_df.iterrows()}
+    
+    candidates_csv = bounce_csv.parent / "bounce_candidates.csv"
+    track_by_frame = {}
+    if candidates_csv.exists():
+        cands_df = pd.read_csv(candidates_csv)
+        if not cands_df.empty:
+            idx_max = cands_df.groupby("frame_idx")["score_blob"].idxmax()
+            best_cands = cands_df.loc[idx_max]
+            for _, r in best_cands.iterrows():
+                track_by_frame[int(r["frame_idx"])] = (float(r["cx"]) * bounce_coord_scale, float(r["cy"]) * bounce_coord_scale)
+
     for _, row in landing_df.iterrows():
         fi = int(row["frame_idx"])
         brow = bounce_by_idx.get(fi, {})
@@ -628,10 +639,31 @@ def make_debug_video_overlay(
 
     H_arr = np.asarray(H, dtype=np.float64)
     accumulated: List[dict] = []
+    trajectory_history = []
 
     for frame_idx, frame in tqdm(frame_iter, total=total_frames, desc="debug overlay"):
         # 1. Project court lines onto the frame
         vis = draw_court_lines_on_frame(frame, H_arr, alpha=court_alpha) if draw_court else frame.copy()
+
+        # Draw ball tracking trail
+        if frame_idx in track_by_frame:
+            cx, cy = track_by_frame[frame_idx]
+            trajectory_history.append((int(round(cx)), int(round(cy))))
+            if len(trajectory_history) > 15:
+                trajectory_history.pop(0)
+                
+        if trajectory_history:
+            for i in range(1, len(trajectory_history)):
+                pt1 = trajectory_history[i - 1]
+                pt2 = trajectory_history[i]
+                intensity = int(255 * (i / len(trajectory_history)))
+                color = (0, intensity, 255)
+                cv2.line(vis, pt1, pt2, color, max(1, int(3 * (i / len(trajectory_history)))), cv2.LINE_AA)
+            
+            # Draw current ball
+            last_pt = trajectory_history[-1]
+            cv2.circle(vis, last_pt, 8, (0, 255, 255), 2, cv2.LINE_AA)
+            cv2.circle(vis, last_pt, 4, (0, 255, 255), -1, cv2.LINE_AA)
 
         # 2. Accumulate new bounces
         new_hits = pixel_by_frame.get(frame_idx, [])

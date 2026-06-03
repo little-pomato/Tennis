@@ -19,42 +19,42 @@ const MARGIN = (COURT.width - COURT.singles_width) / 2;
 const px = (x: number) => x * SCALE + PAD_X;
 const py = (y: number) => y * SCALE + PAD_Y;
 
-const P1 = '#ff6060';
-const P2 = '#4d9eff';
+// Warm player colors
+const P1 = '#E05240';
+const P2 = '#2B8C8C';
 
-// Grid for heatmap: 8 cols × 14 rows
+// Clay court palette
+const CLAY_SURFACE  = '#C07940';
+const CLAY_BORDER   = '#9A5E28';
+const CLAY_LINE     = 'rgba(255,248,235,0.92)';
+
+// Grid for heatmap
 const GRID_COLS = 8;
 const GRID_ROWS = 14;
+
+// 8-directional dust vectors
+const DUST_ANGLES = Array.from({ length: 8 }, (_, i) => (i / 8) * Math.PI * 2);
 
 const Court2D: React.FC<Props> = ({ data, currentFrame }) => {
   const [mode, setMode] = useState<ViewMode>('live');
   const playerTracks = data.results.player_metric_tracks || { top: [], bottom: [] };
   const bounces: any[] = data.results.bounces || [];
 
-  // Sorted once for O(n) lookup. Bounce dots use next-bounce coloring:
-  // the dot at frame F gets the color of whoever caused the bounce at F.
   const ballSpeeds: any[] = useMemo(
     () => [...(data.results.analytics?.ball_speeds ?? [])].sort((a, b) => a.end - b.end),
     [data]
   );
 
   const getHitterColor = (bounceFrame: number): string => {
-    // The bounce's own event has end === bounceFrame (or very close).
-    // Find it by matching end frame directly, then fall back to next-event.
     const exact = ballSpeeds.find((s) => s.end === bounceFrame);
     if (exact) return exact.side === 'top' ? P1 : P2;
-
-    // Fallback: first event whose end >= bounceFrame
     const next = ballSpeeds.find((s) => s.end >= bounceFrame);
     if (next) return next.side === 'top' ? P1 : P2;
-
-    if (ballSpeeds.length > 0) {
+    if (ballSpeeds.length > 0)
       return ballSpeeds[ballSpeeds.length - 1].side === 'top' ? P1 : P2;
-    }
     return P1;
   };
 
-  // Build heatmap grid
   const heatmapGrid = useMemo(() => {
     const cells: number[][] = Array.from({ length: GRID_ROWS }, () => new Array(GRID_COLS).fill(0));
     let maxVal = 0;
@@ -72,40 +72,68 @@ const Court2D: React.FC<Props> = ({ data, currentFrame }) => {
   const inCount = bounces.filter((b) => b.status === 'In').length;
   const outCount = bounces.filter((b) => b.status.includes('Out')).length;
 
+  // Ball stroke arcs between consecutive bounces
+  const strokeArcs = useMemo(() => {
+    const arcs: { x1: number; y1: number; x2: number; y2: number; cpX: number; cpY: number; color: string; endFrame: number }[] = [];
+    for (let i = 1; i < bounces.length; i++) {
+      const prev = bounces[i - 1];
+      const curr = bounces[i];
+      if (!prev.pos_2d || !curr.pos_2d) continue;
+      const x1 = px(prev.pos_2d[0]);
+      const y1 = py(prev.pos_2d[1]);
+      const x2 = px(curr.pos_2d[0]);
+      const y2 = py(curr.pos_2d[1]);
+      // Lift control point above the midpoint (ball arcs over the net)
+      const cpX = (x1 + x2) / 2;
+      const cpY = Math.min(y1, y2) - 22;
+      arcs.push({ x1, y1, x2, y2, cpX, cpY, color: getHitterColor(curr.frame), endFrame: curr.frame });
+    }
+    return arcs;
+  }, [bounces, ballSpeeds]);
+
   return (
     <div
-      className="rounded-2xl overflow-hidden"
-      style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.07)' }}
+      className="rounded-3xl overflow-hidden"
+      style={{
+        background: 'var(--surface)',
+        boxShadow: 'var(--shadow-raised)',
+      }}
     >
       {/* Header */}
       <div className="px-5 pt-5 pb-4 flex items-center justify-between">
         <div>
-          <h3 className="font-bold text-white text-sm">Court Map</h3>
-          <p className="text-xs mt-0.5" style={{ color: 'rgba(255,255,255,0.3)' }}>
+          <h3 className="font-bold text-sm" style={{ color: 'var(--text)', fontFamily: "'Space Mono', monospace" }}>
+            Court Map
+          </h3>
+          <p className="text-xs mt-0.5 font-mono-nums" style={{ color: 'var(--text-muted)' }}>
             {inCount} In · {outCount} Out
           </p>
         </div>
-        {/* Mode toggle */}
+        {/* Mode toggle — neumorphic pill */}
         <div
-          className="flex rounded-xl p-0.5 gap-0.5"
-          style={{ background: 'rgba(255,255,255,0.05)' }}
+          className="flex rounded-xl p-1 gap-0.5"
+          style={{ boxShadow: 'var(--shadow-pressed-sm)', background: 'var(--surface)' }}
         >
           {(['live', 'heatmap'] as ViewMode[]).map((m) => (
             <button
               key={m}
               onClick={() => setMode(m)}
-              className="relative px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors"
-              style={{ color: mode === m ? 'black' : 'rgba(255,255,255,0.4)' }}
+              className="relative px-3 py-1.5 rounded-lg text-xs font-bold transition-all capitalize"
+              style={{
+                color: mode === m ? 'white' : 'var(--text-muted)',
+                background: mode === m ? 'var(--primary)' : 'transparent',
+                boxShadow: mode === m ? '2px 2px 5px rgba(0,102,102,0.35)' : 'none',
+              }}
             >
               {mode === m && (
                 <motion.div
                   layoutId="modePill"
                   className="absolute inset-0 rounded-lg"
-                  style={{ background: '#f5c518' }}
+                  style={{ background: 'var(--primary)', zIndex: -1 }}
                   transition={{ type: 'spring', stiffness: 400, damping: 30 }}
                 />
               )}
-              <span className="relative capitalize">{m}</span>
+              <span className="relative">{m}</span>
             </button>
           ))}
         </div>
@@ -117,17 +145,46 @@ const Court2D: React.FC<Props> = ({ data, currentFrame }) => {
           width={CW}
           height={CH}
           viewBox={`0 0 ${CW} ${CH}`}
-          className="rounded-xl"
-          style={{ background: '#1e4d1a', maxWidth: '100%' }}
+          className="rounded-2xl"
+          style={{ maxWidth: '100%' }}
         >
           <defs>
-            <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
-              <feGaussianBlur stdDeviation="1.5" result="blur" />
+            {/* Warm glow filter */}
+            <filter id="warmGlow" x="-30%" y="-30%" width="160%" height="160%">
+              <feGaussianBlur stdDeviation="2.5" result="blur" />
               <feComposite in="SourceGraphic" in2="blur" operator="over" />
             </filter>
+
+            {/* P1 glow */}
+            <filter id="glowP1" x="-40%" y="-40%" width="180%" height="180%">
+              <feGaussianBlur stdDeviation="3" result="blur" />
+              <feFlood floodColor="#E05240" floodOpacity="0.6" result="color" />
+              <feComposite in="color" in2="blur" operator="in" result="shadow" />
+              <feMerge><feMergeNode in="shadow" /><feMergeNode in="SourceGraphic" /></feMerge>
+            </filter>
+
+            {/* P2 glow */}
+            <filter id="glowP2" x="-40%" y="-40%" width="180%" height="180%">
+              <feGaussianBlur stdDeviation="3" result="blur" />
+              <feFlood floodColor="#2B8C8C" floodOpacity="0.6" result="color" />
+              <feComposite in="color" in2="blur" operator="in" result="shadow" />
+              <feMerge><feMergeNode in="shadow" /><feMergeNode in="SourceGraphic" /></feMerge>
+            </filter>
           </defs>
+
+          {/* Clay border area */}
+          <rect x={0} y={0} width={CW} height={CH} fill={CLAY_BORDER} rx={16} />
+
           {/* Court surface */}
-          <rect x={PAD_X} y={PAD_Y} width={COURT.width * SCALE} height={COURT.length * SCALE} fill="#2d6e28" />
+          <rect x={PAD_X} y={PAD_Y} width={COURT.width * SCALE} height={COURT.length * SCALE} fill={CLAY_SURFACE} />
+
+          {/* Subtle clay texture overlay */}
+          <rect
+            x={PAD_X} y={PAD_Y}
+            width={COURT.width * SCALE} height={COURT.length * SCALE}
+            fill="url(#clayTexture)"
+            opacity={0.08}
+          />
 
           {/* Heatmap overlay */}
           <AnimatePresence>
@@ -147,11 +204,9 @@ const Court2D: React.FC<Props> = ({ data, currentFrame }) => {
                         x={cx} y={cy}
                         width={cellW} height={cellH}
                         initial={{ opacity: 0 }}
-                        animate={{ opacity: intensity * 0.85 }}
+                        animate={{ opacity: intensity * 0.82 }}
                         exit={{ opacity: 0 }}
-                        style={{
-                          fill: `rgba(245, 80, 50, 1)`,
-                        }}
+                        fill="rgba(255,120,50,1)"
                       />
                     );
                   })
@@ -161,35 +216,53 @@ const Court2D: React.FC<Props> = ({ data, currentFrame }) => {
           </AnimatePresence>
 
           {/* Court lines */}
-          {/* Outer boundary */}
           <rect x={px(0)} y={py(0)} width={COURT.width * SCALE} height={COURT.length * SCALE}
-            fill="none" stroke="rgba(255,255,255,0.85)" strokeWidth="2" />
-          {/* Singles sidelines */}
-          <line x1={px(MARGIN)} y1={py(0)} x2={px(MARGIN)} y2={py(COURT.length)} stroke="rgba(255,255,255,0.7)" strokeWidth="1" />
-          <line x1={px(COURT.width - MARGIN)} y1={py(0)} x2={px(COURT.width - MARGIN)} y2={py(COURT.length)} stroke="rgba(255,255,255,0.7)" strokeWidth="1" />
-          {/* Service lines */}
-          <line x1={px(MARGIN)} y1={py(COURT.length / 2 - COURT.service_line)} x2={px(COURT.width - MARGIN)} y2={py(COURT.length / 2 - COURT.service_line)} stroke="rgba(255,255,255,0.7)" strokeWidth="1" />
-          <line x1={px(MARGIN)} y1={py(COURT.length / 2 + COURT.service_line)} x2={px(COURT.width - MARGIN)} y2={py(COURT.length / 2 + COURT.service_line)} stroke="rgba(255,255,255,0.7)" strokeWidth="1" />
-          {/* Center service line */}
-          <line x1={px(COURT.width / 2)} y1={py(COURT.length / 2 - COURT.service_line)} x2={px(COURT.width / 2)} y2={py(COURT.length / 2 + COURT.service_line)} stroke="rgba(255,255,255,0.7)" strokeWidth="1" />
-          {/* Net */}
-          <line x1={px(-0.3)} y1={py(COURT.length / 2)} x2={px(COURT.width + 0.3)} y2={py(COURT.length / 2)} stroke="rgba(0,0,0,0.9)" strokeWidth="4" />
-          <line x1={px(-0.3)} y1={py(COURT.length / 2)} x2={px(COURT.width + 0.3)} y2={py(COURT.length / 2)} stroke="rgba(255,255,255,0.3)" strokeWidth="1" strokeDasharray="4,3" />
+            fill="none" stroke={CLAY_LINE} strokeWidth="2.5" />
+          <line x1={px(MARGIN)} y1={py(0)} x2={px(MARGIN)} y2={py(COURT.length)} stroke={CLAY_LINE} strokeWidth="1.2" />
+          <line x1={px(COURT.width - MARGIN)} y1={py(0)} x2={px(COURT.width - MARGIN)} y2={py(COURT.length)} stroke={CLAY_LINE} strokeWidth="1.2" />
+          <line x1={px(MARGIN)} y1={py(COURT.length / 2 - COURT.service_line)} x2={px(COURT.width - MARGIN)} y2={py(COURT.length / 2 - COURT.service_line)} stroke={CLAY_LINE} strokeWidth="1.2" />
+          <line x1={px(MARGIN)} y1={py(COURT.length / 2 + COURT.service_line)} x2={px(COURT.width - MARGIN)} y2={py(COURT.length / 2 + COURT.service_line)} stroke={CLAY_LINE} strokeWidth="1.2" />
+          <line x1={px(COURT.width / 2)} y1={py(COURT.length / 2 - COURT.service_line)} x2={px(COURT.width / 2)} y2={py(COURT.length / 2 + COURT.service_line)} stroke={CLAY_LINE} strokeWidth="1.2" />
+
+          {/* Net — thick dark band with white dashes */}
+          <line x1={px(-0.4)} y1={py(COURT.length / 2)} x2={px(COURT.width + 0.4)} y2={py(COURT.length / 2)}
+            stroke="rgba(30,20,10,0.85)" strokeWidth="5" />
+          <line x1={px(-0.4)} y1={py(COURT.length / 2)} x2={px(COURT.width + 0.4)} y2={py(COURT.length / 2)}
+            stroke="rgba(255,248,235,0.45)" strokeWidth="1.2" strokeDasharray="5,4" />
 
           {/* Player zone labels */}
-          <text x={px(COURT.width / 2)} y={py(COURT.length * 0.12)} textAnchor="middle" fill={P1} fontSize="9" fontWeight="700" opacity="0.6">P1</text>
-          <text x={px(COURT.width / 2)} y={py(COURT.length * 0.91)} textAnchor="middle" fill={P2} fontSize="9" fontWeight="700" opacity="0.6">P2</text>
+          <text x={px(COURT.width / 2)} y={py(COURT.length * 0.10)} textAnchor="middle" fill={P1} fontSize="9" fontWeight="700" opacity="0.7" fontFamily="Space Mono">P1</text>
+          <text x={px(COURT.width / 2)} y={py(COURT.length * 0.92)} textAnchor="middle" fill={P2} fontSize="9" fontWeight="700" opacity="0.7" fontFamily="Space Mono">P2</text>
 
-          {/* Live mode content */}
+          {/* Live mode */}
           {mode === 'live' && (
             <>
-              {/* Player paths (Segmented for fade effect) */}
+              {/* Ball stroke arcs — trajectory between bounces */}
+              {strokeArcs.map((arc, i) => {
+                const age = currentFrame - arc.endFrame;
+                if (age < 0 || age > 90) return null;
+                const opacity = Math.max(0, 0.55 * (1 - age / 90));
+                return (
+                  <path
+                    key={`arc-${i}`}
+                    d={`M ${arc.x1} ${arc.y1} Q ${arc.cpX} ${arc.cpY} ${arc.x2} ${arc.y2}`}
+                    fill="none"
+                    stroke={arc.color}
+                    strokeWidth={1.8}
+                    strokeOpacity={opacity}
+                    strokeDasharray="5 3.5"
+                    strokeLinecap="round"
+                  />
+                );
+              })}
+
+              {/* Player trails */}
               {(['top', 'bottom'] as const).map((side) => {
                 const track = playerTracks[side];
                 const window = 3;
-                const trailLength = 40;
+                const trailLength = 45;
                 const segments = [];
-                
+
                 for (let i = Math.max(1, currentFrame - trailLength); i <= currentFrame; i++) {
                   const getPos = (idx: number) => {
                     let sx = 0, sy = 0, cnt = 0;
@@ -202,19 +275,18 @@ const Court2D: React.FC<Props> = ({ data, currentFrame }) => {
 
                   const p1 = getPos(i - 1);
                   const p2 = getPos(i);
-
                   if (p1 && p2) {
                     const age = currentFrame - i;
-                    const opacity = Math.max(0, 0.4 * (1 - age / trailLength));
+                    const t = 1 - age / trailLength;
+                    const opacity = Math.max(0, 0.55 * t);
                     segments.push(
                       <line
                         key={`${side}-${i}`}
                         x1={p1.x} y1={p1.y} x2={p2.x} y2={p2.y}
                         stroke={side === 'top' ? P1 : P2}
-                        strokeWidth={2.5 * (1 - age / trailLength)}
+                        strokeWidth={3 * t}
                         strokeOpacity={opacity}
                         strokeLinecap="round"
-                        filter="url(#glow)"
                       />
                     );
                   }
@@ -227,93 +299,138 @@ const Court2D: React.FC<Props> = ({ data, currentFrame }) => {
                 const pt = playerTracks[side][currentFrame];
                 if (!pt || pt.x == null) return null;
                 const color = side === 'top' ? P1 : P2;
+                const glowId = side === 'top' ? 'glowP1' : 'glowP2';
                 return (
                   <g key={`dot-${side}`}>
-                    {/* Pulsing aura */}
                     <motion.circle
-                      cx={px(pt.x)}
-                      cy={py(pt.y)}
-                      r="12"
+                      cx={px(pt.x)} cy={py(pt.y)}
+                      r="14"
                       fill={color}
-                      initial={{ opacity: 0, scale: 0.8 }}
-                      animate={{ opacity: [0.05, 0.15, 0.05], scale: [1, 1.5, 1] }}
-                      transition={{ duration: 2.5, repeat: Infinity, ease: "easeInOut" }}
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: [0.06, 0.18, 0.06], scale: [1, 1.6, 1] }}
+                      transition={{ duration: 2.8, repeat: Infinity, ease: 'easeInOut' }}
                     />
                     <motion.circle
-                      r="6"
+                      r="7"
                       fill={color}
-                      stroke="white"
-                      strokeWidth="2"
-                      filter="url(#glow)"
+                      stroke="rgba(255,248,235,0.9)"
+                      strokeWidth="2.5"
+                      filter={`url(#${glowId})`}
                       animate={{ cx: px(pt.x), cy: py(pt.y) }}
-                      transition={{ type: 'spring', damping: 18, stiffness: 130 }}
+                      transition={{ type: 'spring', damping: 20, stiffness: 150 }}
                     />
                   </g>
                 );
               })}
 
-              {/* Bounce dots */}
+              {/* Bounce dots with squash/stretch + shockwave */}
               {bounces.map((bounce, idx) => {
                 if (!bounce.pos_2d) return null;
-                const isPast = bounce.frame <= currentFrame;
-                const isFresh = Math.abs(bounce.frame - currentFrame) < 5;
-                const isNear = Math.abs(bounce.frame - currentFrame) < 30;
-                const isOut = bounce.status.includes('Out');
-                const col = getHitterColor(bounce.frame);
-                
-                if (!isPast) return null;
+                const diff = currentFrame - bounce.frame;
+                if (diff < 0 || diff > 70) return null;
+
+                const isFresh     = diff < 8;
+                const isShockwave = diff < 38;   // rings play for ~1.25 s
+                const isNear      = diff < 30;
+                const isOut       = bounce.status.includes('Out');
+                const col         = getHitterColor(bounce.frame);
+                const bx          = px(bounce.pos_2d[0]);
+                const by          = py(bounce.pos_2d[1]);
 
                 return (
                   <g key={`bounce-${idx}`}>
-                    {/* Multi-layered dynamic shockwave when ball drops */}
-                    {isFresh && (
+                    {/* Three-layer amber shockwave */}
+                    {isShockwave && (
                       <>
                         <motion.circle
-                          cx={px(bounce.pos_2d[0])}
-                          cy={py(bounce.pos_2d[1])}
-                          initial={{ r: 0, opacity: 0.8, strokeWidth: 2 }}
-                          animate={{ r: 35, opacity: 0, strokeWidth: 0 }}
-                          transition={{ duration: 0.8, ease: "easeOut" }}
-                          fill="none"
-                          stroke={col}
+                          cx={bx} cy={by}
+                          initial={{ r: 2, opacity: 0.92, strokeWidth: 3 }}
+                          animate={{ r: 30, opacity: 0, strokeWidth: 0 }}
+                          transition={{ duration: 0.55, ease: 'easeOut' }}
+                          fill="none" stroke="#FE9900"
                         />
                         <motion.circle
-                          cx={px(bounce.pos_2d[0])}
-                          cy={py(bounce.pos_2d[1])}
-                          initial={{ r: 0, opacity: 1, strokeWidth: 1 }}
-                          animate={{ r: 20, opacity: 0, strokeWidth: 0 }}
-                          transition={{ duration: 0.4, ease: "easeOut", delay: 0.1 }}
-                          fill="none"
-                          stroke="white"
+                          cx={bx} cy={by}
+                          initial={{ r: 2, opacity: 0.6, strokeWidth: 2 }}
+                          animate={{ r: 52, opacity: 0, strokeWidth: 0 }}
+                          transition={{ duration: 0.85, ease: 'easeOut', delay: 0.07 }}
+                          fill="none" stroke="#FE9900"
+                        />
+                        <motion.circle
+                          cx={bx} cy={by}
+                          initial={{ r: 2, opacity: 0.32, strokeWidth: 1 }}
+                          animate={{ r: 78, opacity: 0, strokeWidth: 0 }}
+                          transition={{ duration: 1.3, ease: 'easeOut', delay: 0.14 }}
+                          fill="none" stroke={CLAY_BORDER}
                         />
                       </>
                     )}
-                    
-                    <motion.g
-                      initial={{ scale: 0, opacity: 0 }}
-                      animate={{ 
-                        scale: isFresh ? [0, 1.5, 1] : 1,
-                        opacity: isNear ? 1 : 0.35 
-                      }}
-                      transition={{ duration: 0.5, type: "spring", damping: 15 }}
-                    >
-                      {isOut ? (
-                        <g filter="url(#glow)">
-                          <circle cx={px(bounce.pos_2d[0])} cy={py(bounce.pos_2d[1])} r={isNear ? 6 : 4} fill="none" stroke={col} strokeWidth="2" />
-                          <line x1={px(bounce.pos_2d[0]) - 3} y1={py(bounce.pos_2d[1]) - 3} x2={px(bounce.pos_2d[0]) + 3} y2={py(bounce.pos_2d[1]) + 3} stroke={col} strokeWidth="2" />
-                          <line x1={px(bounce.pos_2d[0]) + 3} y1={py(bounce.pos_2d[1]) - 3} x2={px(bounce.pos_2d[0]) - 3} y2={py(bounce.pos_2d[1]) + 3} stroke={col} strokeWidth="2" />
-                        </g>
-                      ) : (
-                        <circle cx={px(bounce.pos_2d[0])} cy={py(bounce.pos_2d[1])} r={isNear ? 5.5 : 3.5} fill={col} stroke="white" strokeWidth="1.5" filter="url(#glow)" />
-                      )}
-                    </motion.g>
+
+                    {/* Dust particles on impact */}
+                    {isFresh && DUST_ANGLES.map((angle, i) => {
+                      const dist = 15 + (i % 2) * 6;
+                      return (
+                        <motion.circle
+                          key={`dust-${idx}-${i}`}
+                          r={1.8}
+                          fill={CLAY_BORDER}
+                          initial={{ cx: bx, cy: by, opacity: 0.85 }}
+                          animate={{
+                            cx: bx + Math.cos(angle) * dist,
+                            cy: by + Math.sin(angle) * dist,
+                            opacity: 0,
+                          }}
+                          transition={{ duration: 0.45, ease: 'easeOut', delay: i * 0.015 }}
+                        />
+                      );
+                    })}
+
+                    {/* Bounce dot — squash/stretch on fresh impact */}
+                    {isFresh ? (
+                      <motion.circle
+                        cx={bx} cy={by}
+                        r={isOut ? 6 : 6}
+                        fill={isOut ? 'none' : col}
+                        stroke={isOut ? col : 'rgba(255,248,235,0.9)'}
+                        strokeWidth={isOut ? 2 : 1.8}
+                        filter="url(#warmGlow)"
+                        style={{ transformBox: 'fill-box', transformOrigin: 'center' }}
+                        initial={{ scaleX: 0, scaleY: 0, opacity: 0 }}
+                        animate={{
+                          scaleX: [0, 2.1, 0.65, 1.12, 0.95, 1],
+                          scaleY: [0, 0.28, 1.6,  0.85, 1.05, 1],
+                          opacity: [0, 1,   1,    1,    1,    1],
+                        }}
+                        transition={{
+                          duration: 0.75,
+                          times: [0, 0.18, 0.45, 0.65, 0.82, 1],
+                          ease: 'easeOut',
+                        }}
+                      />
+                    ) : isOut ? (
+                      <g filter="url(#warmGlow)" opacity={isNear ? 1 : 0.4}>
+                        <circle cx={bx} cy={by} r={isNear ? 6 : 4} fill="none" stroke={col} strokeWidth="2" />
+                        <line x1={bx - 4} y1={by - 4} x2={bx + 4} y2={by + 4} stroke={col} strokeWidth="2" />
+                        <line x1={bx + 4} y1={by - 4} x2={bx - 4} y2={by + 4} stroke={col} strokeWidth="2" />
+                      </g>
+                    ) : (
+                      <circle
+                        cx={bx} cy={by}
+                        r={isNear ? 6 : 3.5}
+                        fill={col}
+                        stroke="rgba(255,248,235,0.85)"
+                        strokeWidth="1.5"
+                        opacity={isNear ? 1 : 0.45}
+                        filter="url(#warmGlow)"
+                      />
+                    )}
                   </g>
                 );
               })}
             </>
           )}
 
-          {/* Heatmap mode — all bounce dots static */}
+          {/* Heatmap mode — static bounce dots */}
           {mode === 'heatmap' && (
             <>
               {bounces.map((bounce, idx) => {
@@ -325,13 +442,14 @@ const Court2D: React.FC<Props> = ({ data, currentFrame }) => {
                     key={`hmb-${idx}`}
                     cx={px(bounce.pos_2d[0])}
                     cy={py(bounce.pos_2d[1])}
-                    r={isOut ? 3 : 4}
+                    r={isOut ? 3.5 : 5}
                     fill={isOut ? 'none' : col}
                     stroke={col}
                     strokeWidth={isOut ? 1.5 : 0.5}
                     initial={{ scale: 0, opacity: 0 }}
-                    animate={{ scale: 1, opacity: isOut ? 0.5 : 0.85 }}
-                    transition={{ delay: idx * 0.01, type: 'spring', stiffness: 300, damping: 20 }}
+                    animate={{ scale: 1, opacity: isOut ? 0.55 : 0.88 }}
+                    transition={{ delay: idx * 0.01, type: 'spring', stiffness: 280, damping: 22 }}
+                    style={{ transformBox: 'fill-box', transformOrigin: 'center' }}
                   />
                 );
               })}
@@ -342,25 +460,25 @@ const Court2D: React.FC<Props> = ({ data, currentFrame }) => {
 
       {/* Legend */}
       <div
-        className="mx-5 mb-5 rounded-xl p-3 flex items-center justify-around text-xs"
-        style={{ background: 'rgba(255,255,255,0.03)' }}
+        className="mx-5 mb-5 rounded-2xl px-4 py-3 flex items-center justify-around text-xs"
+        style={{ boxShadow: 'var(--shadow-pressed-sm)', background: 'var(--surface)' }}
       >
         <div className="flex items-center gap-1.5">
           <div className="w-2.5 h-2.5 rounded-full" style={{ background: P1 }} />
-          <span style={{ color: 'rgba(255,255,255,0.45)' }}>Player 1</span>
+          <span style={{ color: 'var(--text-muted)' }}>Player 1</span>
         </div>
         <div className="flex items-center gap-1.5">
           <div className="w-2.5 h-2.5 rounded-full" style={{ background: P2 }} />
-          <span style={{ color: 'rgba(255,255,255,0.45)' }}>Player 2</span>
+          <span style={{ color: 'var(--text-muted)' }}>Player 2</span>
         </div>
         <div className="flex items-center gap-1.5">
-          <div className="w-2.5 h-2.5 rounded-full border border-white/30" style={{ background: 'transparent' }} />
-          <span style={{ color: 'rgba(255,255,255,0.45)' }}>Out</span>
+          <div className="w-2.5 h-2.5 rounded-full border-2" style={{ borderColor: 'var(--text-subtle)', background: 'transparent' }} />
+          <span style={{ color: 'var(--text-muted)' }}>Out</span>
         </div>
         {mode === 'heatmap' && (
           <div className="flex items-center gap-1.5">
-            <div className="w-2.5 h-2.5 rounded-sm" style={{ background: 'rgba(245,80,50,0.7)' }} />
-            <span style={{ color: 'rgba(255,255,255,0.45)' }}>Frequency</span>
+            <div className="w-2.5 h-2.5 rounded-sm" style={{ background: 'rgba(255,120,50,0.7)' }} />
+            <span style={{ color: 'var(--text-muted)' }}>Density</span>
           </div>
         )}
       </div>

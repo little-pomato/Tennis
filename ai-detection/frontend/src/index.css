@@ -1,13 +1,44 @@
 @import "tailwindcss";
 
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400;1,700&family=JetBrains+Mono:wght@400;500;600;700;800&display=swap');
 
 :root {
-  font-family: 'Inter', system-ui, sans-serif;
+  /* Surface */
+  --surface: #E7E5E4;
+  --surface-light: #F5F3F2;
+  --surface-dark: #D0CECA;
+
+  /* Brand */
+  --primary: #006666;
+  --primary-hover: #007a7a;
+  --primary-muted: rgba(0, 102, 102, 0.12);
+
+  /* Text */
+  --text: #1E2938;
+  --text-muted: rgba(30, 41, 56, 0.55);
+  --text-subtle: rgba(30, 41, 56, 0.32);
+
+  /* Semantic */
+  --warning: #FE9900;
+  --danger: #FF2157;
+  --success: #00A63D;
+
+  /* Players */
+  --p1: #E05240;
+  --p2: #2B8C8C;
+
+  /* Neumorphic shadows */
+  --shadow-raised-lg: 12px 12px 24px #C0BEBB, -12px -12px 24px #FFFFFF;
+  --shadow-raised:    8px 8px 16px  #C8C6C4, -8px  -8px 16px  #FFFFFF;
+  --shadow-raised-sm: 4px 4px 8px   #C8C6C4, -4px  -4px 8px   #FFFFFF;
+  --shadow-pressed:   inset 5px 5px 10px #C8C6C4, inset -5px -5px 10px #FFFFFF;
+  --shadow-pressed-sm:inset 3px 3px 6px  #C8C6C4, inset -3px -3px 6px  #FFFFFF;
+
+  font-family: 'Space Mono', monospace;
   line-height: 1.5;
   font-weight: 400;
-  color: rgba(255, 255, 255, 0.9);
-  background-color: #060a14;
+  color: var(--text);
+  background-color: var(--surface);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
@@ -17,36 +48,31 @@ body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
-  background-color: #060a14;
+  background-color: var(--surface);
 }
 
-#root {
-  width: 100%;
-}
+#root { width: 100%; }
+* { box-sizing: border-box; }
 
-* {
-  box-sizing: border-box;
-}
-
-::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
-}
-
-::-webkit-scrollbar-track {
-  background: transparent;
-}
-
+/* Scrollbar */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.1);
-  border-radius: 3px;
+  background: var(--surface-dark);
+  border-radius: 4px;
 }
-
-::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.2);
-}
+::-webkit-scrollbar-thumb:hover { background: #B8B5B2; }
 
 ::selection {
-  background: rgba(245, 197, 24, 0.3);
-  color: white;
+  background: rgba(0, 102, 102, 0.22);
+  color: var(--text);
 }
+
+/* Neumorphic utility classes */
+.neu-raised    { box-shadow: var(--shadow-raised); }
+.neu-raised-sm { box-shadow: var(--shadow-raised-sm); }
+.neu-raised-lg { box-shadow: var(--shadow-raised-lg); }
+.neu-pressed   { box-shadow: var(--shadow-pressed); }
+
+/* JetBrains Mono for numeric stat values */
+.font-mono-nums { font-family: 'JetBrains Mono', monospace; }

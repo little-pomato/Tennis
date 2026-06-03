@@ -7,6 +7,7 @@ import torch
 import logging
 import numpy as np
 from pathlib import Path
+from time import perf_counter
 from typing import Dict, Any
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
@@ -60,6 +61,23 @@ TEMP_DIR.mkdir(exist_ok=True)
 device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
 model_cfg = ModelConfig()
 
+def get_env_int(name: str, default: int | None) -> int | None:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %r", name, value, default)
+        return default
+    return parsed if parsed > 0 else default
+
+target_fps = get_env_int("VIDEO_TARGET_FPS", 20)
+max_long_side = get_env_int("VIDEO_MAX_LONG_SIDE", 640)
+ball_batch_size = get_env_int("TRACKNET_BATCH_SIZE", None)
+frame_cache_size = get_env_int("VIDEO_FRAME_CACHE_SIZE", 96)
+resized_cache_size = get_env_int("VIDEO_RESIZED_CACHE_SIZE", 128)
+
 # In-memory progress storage (In production, use Redis or a database)
 processing_status = {}
 
@@ -77,20 +95,29 @@ def run_detection_pipeline(video_path: str, request_id: str):
         frames_dir = request_temp_dir / "frames"
         frames_dir.mkdir(exist_ok=True)
         
+        started = perf_counter()
         frame_paths, fps, width, height = read_video_to_disk(
             video_path, 
             temp_dir=str(frames_dir), 
-            max_long_side=640, 
-            target_fps=20
+            max_long_side=max_long_side,
+            target_fps=target_fps
         )
-        context = VideoContext(frame_paths=frame_paths, fps=fps, width=width, height=height)
+        context = VideoContext(
+            frame_paths=frame_paths,
+            fps=fps,
+            width=width,
+            height=height,
+            frame_cache_size=frame_cache_size,
+            resized_cache_size=resized_cache_size,
+        )
+        context.timings["FrameExtraction"] = perf_counter() - started
 
         processing_status[request_id] = {"status": "processing", "progress": 30, "message": "Initializing models..."}
         
         # 2. Build and Run Pipeline
         pipeline = Pipeline()
         pipeline.add_node(CourtDetector(model_cfg.court_model_path, device=device))
-        pipeline.add_node(BallDetector(model_cfg.ball_model_path, device=device))
+        pipeline.add_node(BallDetector(model_cfg.ball_model_path, device=device, batch_size=ball_batch_size))
         pipeline.add_node(TrajectoryRefiner())
         pipeline.add_node(BounceDetector(model_cfg.bounce_model_path))
         pipeline.add_node(PlayerDetector(device=device))
@@ -130,7 +157,8 @@ def run_detection_pipeline(video_path: str, request_id: str):
                 "fps": float(context.fps),
                 "width": context.width,
                 "height": context.height,
-                "total_frames": len(context.frame_paths)
+                "total_frames": len(context.frame_paths),
+                "timings": context.timings
             },
             "results": {
                 "ball_track": [{"frame": i, "x": pt[0], "y": pt[1]} for i, pt in enumerate(context.ball_track)],
@@ -164,6 +192,8 @@ def run_detection_pipeline(video_path: str, request_id: str):
     finally:
         if os.path.exists(video_path):
             os.remove(video_path)
+        if request_temp_dir.exists():
+            shutil.rmtree(request_temp_dir, ignore_errors=True)
 
 @app.post("/upload")
 async def upload_and_detect(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
@@ -188,7 +218,15 @@ async def get_status(request_id: str):
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "device": device}
+    return {
+        "status": "ok",
+        "device": device,
+        "target_fps": target_fps,
+        "max_long_side": max_long_side,
+        "tracknet_batch_size": ball_batch_size,
+        "frame_cache_size": frame_cache_size,
+        "resized_cache_size": resized_cache_size,
+    }
 
 if __name__ == "__main__":
     import uvicorn

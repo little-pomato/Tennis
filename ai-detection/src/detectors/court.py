@@ -30,11 +30,11 @@ class CourtDetector(BaseDetector):
         # Optimization: Detect once for static camera
         print("Detecting court (static camera optimization)...")
         first_frame = context.get_frame(0)
-        img = cv2.resize(first_frame, (output_width, output_height))
+        img = context.get_resized_frame(0, output_width, output_height)
         inp = (img.astype(np.float32) / 255.)
-        inp = torch.tensor(np.rollaxis(inp, 2, 0)).unsqueeze(0).to(self.device)
+        inp = torch.from_numpy(np.rollaxis(inp, 2, 0)).unsqueeze(0).to(self.device)
 
-        with torch.no_grad():
+        with torch.inference_mode():
             out = self.model(inp.float())[0]
         pred = torch.sigmoid(out).detach().cpu().numpy()
 

@@ -12,7 +12,8 @@ class DataExporter:
                 "fps": context.fps,
                 "width": context.width,
                 "height": context.height,
-                "total_frames": len(context.frame_paths)
+                "total_frames": len(context.frame_paths),
+                "timings": context.timings
             },
             "results": {
                 "ball_track": [

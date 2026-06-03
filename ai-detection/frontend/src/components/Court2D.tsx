@@ -69,22 +69,6 @@ const Court2D: React.FC<Props> = ({ data, currentFrame }) => {
     return { cells, maxVal };
   }, [bounces]);
 
-  // Smoothed player path (last 60 frames)
-  const getPlayerPath = (side: 'top' | 'bottom') => {
-    const track = playerTracks[side];
-    const window = 3;
-    const pts: string[] = [];
-    for (let i = Math.max(0, currentFrame - 60); i <= currentFrame; i++) {
-      let sx = 0, sy = 0, cnt = 0;
-      for (let j = Math.max(0, i - window); j <= Math.min(track.length - 1, i + window); j++) {
-        const p = track[j];
-        if (p?.x !== null && p?.x !== undefined) { sx += p.x; sy += p.y; cnt++; }
-      }
-      if (cnt > 0) pts.push(`${px(sx / cnt)},${py(sy / cnt)}`);
-    }
-    return pts.join(' ');
-  };
-
   const inCount = bounces.filter((b) => b.status === 'In').length;
   const outCount = bounces.filter((b) => b.status.includes('Out')).length;
 

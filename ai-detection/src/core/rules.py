@@ -20,6 +20,7 @@ class InoutRuleEngine(BaseDetector):
             analysis.append({
                 "frame": hit["frame"],
                 "pos_2d": hit["pos_2d"],
+                "pos_img": hit["pos_img"],
                 "status": "Out - Hit Net"
             })
 
@@ -36,6 +37,7 @@ class InoutRuleEngine(BaseDetector):
                 analysis.append({
                     "frame": frame_idx,
                     "pos_2d": None,
+                    "pos_img": None,
                     "status": "Unknown (Missing Tracking/Court)"
                 })
                 continue
@@ -46,6 +48,7 @@ class InoutRuleEngine(BaseDetector):
             analysis.append({
                 "frame": frame_idx,
                 "pos_2d": pos_2d,
+                "pos_img": ball_pos,
                 "status": status
             })
             
@@ -92,7 +95,12 @@ class InoutRuleEngine(BaseDetector):
                 if p_next is None and v_in > 0.1: # Was moving, then disappeared
                     # Check if it stays dead for a few frames
                     if all(p is None for p in projected[i+1 : i+5]):
-                        net_hits.append({"frame": i, "pos_2d": p_curr, "type": "termination"})
+                        net_hits.append({
+                            "frame": i,
+                            "pos_2d": p_curr,
+                            "pos_img": context.ball_track[i],
+                            "type": "termination",
+                        })
                         continue
 
                 if p_next is not None:
@@ -102,12 +110,22 @@ class InoutRuleEngine(BaseDetector):
                     # (p_curr[1]-p_prev[1]) and (p_next[1]-p_curr[1]) have different signs
                     if (p_curr[1]-p_prev[1]) * (p_next[1]-p_curr[1]) < 0:
                         if v_in > 0.05: # Ignore micro-jitters
-                            net_hits.append({"frame": i, "pos_2d": p_curr, "type": "reversal"})
+                            net_hits.append({
+                                "frame": i,
+                                "pos_2d": p_curr,
+                                "pos_img": context.ball_track[i],
+                                "type": "reversal",
+                            })
                             continue
                     
                     # Signal 3: Drastic Deceleration (The "Trickle")
                     if v_in > 0.15 and v_out < (v_in * 0.2):
-                        net_hits.append({"frame": i, "pos_2d": p_curr, "type": "deceleration"})
+                        net_hits.append({
+                            "frame": i,
+                            "pos_2d": p_curr,
+                            "pos_img": context.ball_track[i],
+                            "type": "deceleration",
+                        })
 
         # Filter duplicates (cluster events within 15 frames)
         if not net_hits: return []

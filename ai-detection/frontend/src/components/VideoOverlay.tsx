@@ -16,30 +16,35 @@ const VideoOverlay: React.FC<Props> = ({ videoUrl, data, onFrameUpdate }) => {
   const originalHeight = data.metadata.height;
   const totalFrames = data.metadata.total_frames;
 
-  // Sort ball_speeds by bounce frame once; used for trajectory coloring.
-  // Key insight: we use the NEXT bounce's event to color each frame segment,
-  // not the [start, end] range — because `start` (hit frame) is estimated and
-  // can be off, but `end` (bounce frame) is always exact. This ensures the
-  // entire trajectory between two bounces shows one solid, correct color.
+  // Sort shot events by hit frame. Trajectory color should change when a player
+  // hits the ball, not only when the ball bounces.
   const ballSpeeds: any[] = useMemo(
-    () => [...(data.results.analytics?.ball_speeds ?? [])].sort((a, b) => a.end - b.end),
+    () => [...(data.results.analytics?.ball_speeds ?? [])].sort((a, b) => a.start - b.start),
     [data]
   );
+  const ballOwnership: any[] = data.results.analytics?.ball_ownership ?? [];
 
   const getBallColor = (frameIdx: number): string => {
-    // Find the first event whose bounce (end) is >= frameIdx.
-    // Everything before that bounce belongs to that hitter.
+    const ownership = ballOwnership[frameIdx];
+    if (ownership?.owner) {
+      return ownership.owner === 'bottom' ? 'rgb(59, 130, 246)' : 'rgb(239, 68, 68)';
+    }
+
+    let activeEvent = null;
     for (const evt of ballSpeeds) {
-      if (evt.end >= frameIdx) {
-        return evt.side === 'bottom' ? 'rgb(59, 130, 246)' : 'rgb(239, 68, 68)';
+      if (evt.start <= frameIdx) {
+        activeEvent = evt;
+      } else {
+        break;
       }
     }
-    // After the last known bounce: keep last hitter's color
-    if (ballSpeeds.length > 0) {
-      const last = ballSpeeds[ballSpeeds.length - 1];
-      return last.side === 'bottom' ? 'rgb(59, 130, 246)' : 'rgb(239, 68, 68)';
+
+    if (activeEvent) {
+      return activeEvent.side === 'bottom' ? 'rgb(59, 130, 246)' : 'rgb(239, 68, 68)';
     }
-    return 'rgb(245, 197, 24)'; // no analytics → yellow
+
+    // Before the first detected hit, ownership is unknown.
+    return 'rgb(245, 197, 24)';
   };
 
   // Interpolate ball position for sub-frame accuracy
@@ -58,6 +63,19 @@ const VideoOverlay: React.FC<Props> = ({ videoUrl, data, onFrameUpdate }) => {
       };
     }
     return p1 || null;
+  };
+
+  const getBounceVideoPoint = (bounce: any) => {
+    if (bounce.pos_img && bounce.pos_img[0] !== null) {
+      return { x: bounce.pos_img[0], y: bounce.pos_img[1] };
+    }
+
+    const tracked = data.results.ball_track[bounce.frame];
+    if (tracked && tracked.x !== null) {
+      return { x: tracked.x, y: tracked.y };
+    }
+
+    return null;
   };
 
   const renderFrame = () => {
@@ -83,9 +101,10 @@ const VideoOverlay: React.FC<Props> = ({ videoUrl, data, onFrameUpdate }) => {
     const scaleX = canvas.width / originalWidth;
     const scaleY = canvas.height / originalHeight;
 
-    // 1. Draw Trajectory (Enhanced 'Comet' Trail)
-    const maxHistory = 30;
+    // 1. Draw trajectory with one stable owner color for the visible trail.
+    const maxHistory = 24;
     const startJ = Math.max(1, frameIdx - maxHistory);
+    const activeTrailColor = getBallColor(frameIdx);
     
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
@@ -96,13 +115,10 @@ const VideoOverlay: React.FC<Props> = ({ videoUrl, data, onFrameUpdate }) => {
       
       if (p1 && p2 && p1.x !== null && p2.x !== null) {
         const age = frameIdx - j;
-        const alpha = Math.max(0, 1.0 - (age / maxHistory));
-        const color = getBallColor(j);
+        const alpha = Math.max(0, 1.0 - age / maxHistory);
         
-        // Tapered width: thicker near the ball, thinner at the tail
-        ctx.lineWidth = 1.0 + (3.0 * (1 - age / maxHistory));
-        
-        const rgba = color.replace('rgb', 'rgba').replace(')', `, ${alpha * 0.7})`);
+        ctx.lineWidth = 1.2 + (2.2 * (1 - age / maxHistory));
+        const rgba = activeTrailColor.replace('rgb', 'rgba').replace(')', `, ${alpha * 0.68})`);
         
         ctx.beginPath();
         ctx.moveTo(p1.x * scaleX, p1.y * scaleY);
@@ -157,64 +173,60 @@ const VideoOverlay: React.FC<Props> = ({ videoUrl, data, onFrameUpdate }) => {
       });
     }
 
-    // 4. Draw Bounces (Shockwave effect)
+    // 4. Draw bounces with compact markers.
     data.results.bounces.forEach((bounce: any) => {
       const diff = frameIdx - bounce.frame;
-      if (diff >= 0 && diff < 45) {
-        const isFresh = diff < 8;
-        const alpha = 1 - (diff / 45);
+      if (diff >= 0 && diff < 36) {
+        const videoPoint = getBounceVideoPoint(bounce);
+        if (!videoPoint) return;
+
+        const isFresh = diff < 10;
+        const alpha = 1 - (diff / 36);
         const isOut = bounce.status.includes('Out');
         const baseColor = getBallColor(bounce.frame);
         const colorStr = baseColor.replace('rgb(', '').replace(')', '');
-        const bx = bounce.pos_2d[0] * scaleX;
-        const by = bounce.pos_2d[1] * scaleY;
-        
-        // Impact Shockwave
-        if (isFresh) {
-          const rippleRadius = (diff / 8) * 45;
-          const rippleAlpha = 1 - (diff / 8);
-          
-          ctx.beginPath();
-          ctx.arc(bx, by, rippleRadius, 0, Math.PI * 2);
-          ctx.strokeStyle = `rgba(${colorStr}, ${rippleAlpha})`;
-          ctx.lineWidth = 3;
-          ctx.stroke();
+        const bx = videoPoint.x * scaleX;
+        const by = videoPoint.y * scaleY;
 
-          ctx.beginPath();
-          ctx.arc(bx, by, rippleRadius * 0.7, 0, Math.PI * 2);
-          ctx.strokeStyle = `rgba(255, 255, 255, ${rippleAlpha * 0.6})`;
-          ctx.lineWidth = 2;
-          ctx.stroke();
-        }
+        const markerRadius = isFresh ? 7 + (2 * (1 - diff / 10)) : 5;
 
-        // Marker
         ctx.beginPath();
-        const markerRadius = isFresh ? 12 + (8 * (1 - diff / 8)) : 6;
+        ctx.arc(bx, by, markerRadius + 4, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(0, 0, 0, ${0.32 * alpha})`;
+        ctx.fill();
+
+        ctx.beginPath();
         ctx.arc(bx, by, markerRadius, 0, Math.PI * 2);
         
         if (isOut) {
-          ctx.strokeStyle = `rgba(${colorStr}, ${alpha})`;
-          ctx.lineWidth = isFresh ? 4 : 2;
+          ctx.strokeStyle = `rgba(${colorStr}, ${alpha * 0.95})`;
+          ctx.lineWidth = 2;
           ctx.stroke();
           
-          // Cross
-          const r = markerRadius * 0.7;
+          const r = markerRadius * 0.6;
           ctx.beginPath();
           ctx.moveTo(bx - r, by - r); ctx.lineTo(bx + r, by + r);
           ctx.moveTo(bx + r, by - r); ctx.lineTo(bx - r, by + r);
           ctx.stroke();
         } else {
-          ctx.fillStyle = `rgba(${colorStr}, ${alpha})`;
+          ctx.fillStyle = `rgba(${colorStr}, ${alpha * 0.9})`;
           ctx.fill();
           ctx.strokeStyle = `rgba(255, 255, 255, ${alpha * 0.5})`;
           ctx.lineWidth = 1;
           ctx.stroke();
         }
         
-        if (diff < 15) {
-          ctx.fillStyle = `rgba(255, 255, 255, ${1 - diff / 15})`;
-          ctx.font = 'bold 16px Inter';
-          ctx.fillText(bounce.status, bx + 25, by + 5);
+        if (diff < 18) {
+          const labelAlpha = 1 - diff / 18;
+          const label = isOut ? bounce.status.replace('Out - ', '') : 'In';
+          ctx.font = 'bold 12px Inter';
+          const metrics = ctx.measureText(label);
+          const labelX = bx + 12;
+          const labelY = by - 18;
+          ctx.fillStyle = `rgba(0, 0, 0, ${0.5 * labelAlpha})`;
+          ctx.fillRect(labelX - 5, labelY - 14, metrics.width + 10, 19);
+          ctx.fillStyle = `rgba(255, 255, 255, ${labelAlpha})`;
+          ctx.fillText(label, labelX, labelY);
         }
       }
     });
